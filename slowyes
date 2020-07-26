@@ -7,7 +7,7 @@ my $line  = $ARGV[1] || 'y';
 my $start = time;
 my $span  = undef;
 while (1) {
-    syswrite( STDOUT, "$line\n" );
+    syswrite STDOUT, "$line\n";
     $span = $delay - ( time - $start ) * 1000000;
     usleep($span) if ( $span > 0 );
     $start = time;

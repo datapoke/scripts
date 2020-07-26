@@ -5,8 +5,8 @@ use Time::HiRes qw( time );
 my $size  = 0;
 my $then  = time;
 my $delay = $ARGV[0] || 2;
-alarm($delay);
-$SIG{ALRM} = sub {
+alarm $delay;
+local $SIG{ALRM} = sub {
     my $span = time - $then;
     if ( $size > 1024 * 1024 * $span ) {
         printf "%.2f MB per second\n", $size / ( 1024 * 1024 ) / $span;
@@ -17,10 +17,9 @@ $SIG{ALRM} = sub {
     else {
         printf "%.2f bytes per second\n", $size / $span;
     }
-    alarm($delay);
+    alarm $delay;
     $size = 0;
     $then = time;
 };
 my $buffer;
-my $rv;
 $size += sysread( STDIN, $buffer, 65536 ) // 0 while (1);
