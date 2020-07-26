@@ -11,9 +11,10 @@ my $winch     = undef;
 local $SIG{WINCH} = sub { $winch = 1 };
 
 if ( $ARGV[0] =~ m{^-} ) {
-    my $args = shift @ARGV;
-    $args .= qq{ } . shift @ARGV if ( $args !~ m{=} );
-    GetOptionsFromString( $args, 'n=i' => \$delay );
+    my $arg = shift @ARGV;
+    $arg =~ s{^-(\w)(.+)}{-$1=$2};
+    $arg .= qq{=} . shift @ARGV if ( $arg !~ m{=} );
+    GetOptionsFromString( $arg, 'n=i' => \$delay );
 }
 
 if (@ARGV) {
