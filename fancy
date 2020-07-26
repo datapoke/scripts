@@ -10,7 +10,7 @@ my $Height    = `tput lines`;
 my $Winch     = undef;
 local $SIG{WINCH} = sub { $Winch = 1 };
 
-if ( $ARGV[0] =~ m{^-} ) {
+if ( @ARGV and $ARGV[0] =~ m{^-} ) {
     my $arg = shift @ARGV;
     $arg =~ s{^-(\w)(.+)}{-$1=$2};
     $arg .= q{=} . shift @ARGV if ( $arg !~ m{=} );
