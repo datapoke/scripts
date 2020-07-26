@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 use warnings;
 use strict;
-use Getopt::Long;
+use Getopt::Long qw( GetOptionsFromString );
 my $delay     = 0;
 my $timestamp = 0;
 my $count     = 1;
@@ -10,21 +10,11 @@ my $height    = `tput lines`;
 my $winch     = undef;
 local $SIG{WINCH} = sub { $winch = 1 };
 
-# ugh.
-if (@ARGV) {
-    if ( $ARGV[0] =~ m{^-} ) {
-        if ( $ARGV[0] =~ m{=} ) {
-            splice @ARGV, 1, 0, q(--);
-        }
-        else {
-            splice @ARGV, 2, 0, q(--);
-        }
-    }
-    else {
-        unshift @ARGV, q(--);
-    }
+if ( $ARGV[0] =~ m{^-} ) {
+    my $args = shift @ARGV;
+    $args .= qq{ } . shift @ARGV if ( $args !~ m{=} );
+    GetOptionsFromString( $args, 'n=i' => \$delay );
 }
-GetOptions( 'n=i' => \$delay );
 
 if (@ARGV) {
     while (1) {
