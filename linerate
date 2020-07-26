@@ -7,7 +7,7 @@ my $delay = $ARGV[0] || 2;
 my $i     = 0;
 alarm($delay);
 $SIG{ALRM} = sub {
-    printf "%.2f lines per second\n", $i / (time - $then);
+    printf "%.2f lines per second\n", $i / ( time - $then );
     alarm($delay);
     $i    = 0;
     $then = time;
