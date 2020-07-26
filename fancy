@@ -14,7 +14,8 @@ if ( @ARGV and $ARGV[0] =~ m{^-} ) {
     my $arg = shift @ARGV;
     $arg =~ s{^-(\w)(.+)}{-$1=$2};
     $arg .= q{=} . shift @ARGV if ( $arg !~ m{=} );
-    GetOptionsFromString( $arg, 'n=i' => \$Delay );
+    my $r = GetOptionsFromString( $arg, 'n=i' => \$Delay );
+    die "Usage: fancy [ -n <seconds> ] [ <command> ]\n" if ( not $r );
 }
 
 if (@ARGV) {
