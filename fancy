@@ -2,36 +2,36 @@
 use warnings;
 use strict;
 use Getopt::Long qw( GetOptionsFromString );
-my $delay     = 0;
-my $timestamp = 0;
-my $count     = 1;
-my $width     = `tput cols`;
-my $height    = `tput lines`;
-my $winch     = undef;
-local $SIG{WINCH} = sub { $winch = 1 };
+my $Delay     = 0;
+my $Timestamp = 0;
+my $Count     = 1;
+my $Width     = `tput cols`;
+my $Height    = `tput lines`;
+my $Winch     = undef;
+local $SIG{WINCH} = sub { $Winch = 1 };
 
 if ( $ARGV[0] =~ m{^-} ) {
     my $arg = shift @ARGV;
     $arg =~ s{^-(\w)(.+)}{-$1=$2};
-    $arg .= qq{=} . shift @ARGV if ( $arg !~ m{=} );
-    GetOptionsFromString( $arg, 'n=i' => \$delay );
+    $arg .= q{=} . shift @ARGV if ( $arg !~ m{=} );
+    GetOptionsFromString( $arg, 'n=i' => \$Delay );
 }
 
 if (@ARGV) {
     while (1) {
         my $fh = undef;
         open $fh, q{-|}, @ARGV or die $!;
-        $delay ||= 2;
-        $timestamp = 0;
-        $count     = 1;
+        $Delay ||= 2;
+        $Timestamp = 0;
+        $Count     = 1;
         draw($fh);
         close $fh or die $!;
-        sleep $delay;
+        sleep $Delay;
     }
 }
 else {
     my $fh = *STDIN;
-    $delay ||= 60;
+    $Delay ||= 60;
     draw($fh);
 }
 
@@ -46,7 +46,7 @@ sub draw {
         else {
             $color = "\e[90m";
         }
-        if ( not @ARGV or $count > 1 ) {
+        if ( not @ARGV or $Count > 1 ) {
             chomp $line;
             print $color, $line, "\e[0m\n";
         }
@@ -59,21 +59,30 @@ sub draw {
 
 sub clear {
     my $line  = shift;
-    my $clear = 1;
-    if ($winch) {
-        $winch  = undef;
-        $width  = `tput cols`;
-        $height = `tput lines`;
+    my $clear = undef;
+    my $rv    = 1;
+    if ($Winch) {
+        $Winch  = undef;
+        $Width  = `tput cols`;
+        $Height = `tput lines`;
     }
-    my $span = int( length($line) / $width + 1 );
-    $count += $span;
-    if ( @ARGV and $timestamp ) {
-        $clear = undef if ( $count >= $height );
+    my $span = int( length($line) / $Width + 1 );
+    $Count += $span;
+    if (@ARGV) {
+        if ( not $Timestamp ) {
+            $clear = 1;
+        }
+        else {
+            $rv = undef if ( $Count >= $Height );
+        }
     }
-    elsif ( time - $timestamp > $delay or $count >= $height ) {
-        $count     = $span;
-        $timestamp = time;
+    elsif ( time - $Timestamp > $Delay or $Count >= $Height ) {
+        $clear = 1;
+    }
+    if ($clear) {
+        $Count     = $span;
+        $Timestamp = time;
         print "\e[H\e[2J";
     }
-    return $clear;
+    return $rv;
 }
