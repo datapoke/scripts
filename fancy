@@ -20,7 +20,7 @@ if ( @ARGV and $ARGV[0] =~ m{^-} ) {
 if (@ARGV) {
     while (1) {
         my $fh = undef;
-        open $fh, q{-|}, @ARGV or die $!;
+        open $fh, q{-|}, @ARGV or die;
         $Delay ||= 2;
         $Timestamp = 0;
         $Count     = 1;
