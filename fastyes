@@ -1,0 +1,5 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+my $buf = "y\n" x 32768;
+syswrite(STDOUT, $buf) while(1);

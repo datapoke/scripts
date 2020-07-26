@@ -1,0 +1,88 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+use Getopt::Long;
+my $delay     = 0;
+my $timestamp = 0;
+my $count     = 1;
+my $width     = `tput cols`;
+my $height    = `tput lines`;
+my $winch     = undef;
+local $SIG{WINCH} = sub { $winch = 1 };
+
+# ugh.
+if (@ARGV) {
+    if ( $ARGV[0] =~ m{^-} ) {
+        if ( $ARGV[0] =~ m{=} ) {
+            splice @ARGV, 1, 0, q(--);
+        }
+        else {
+            splice @ARGV, 2, 0, q(--);
+        }
+    }
+    else {
+        unshift @ARGV, q(--);
+    }
+}
+GetOptions( 'n=i' => \$delay );
+
+if (@ARGV) {
+    while (1) {
+        my $fh = undef;
+        open $fh, q{-|}, @ARGV or die $!;
+        $delay ||= 2;
+        $timestamp = 0;
+        $count     = 1;
+        draw($fh);
+        close $fh or die $!;
+        sleep $delay;
+    }
+}
+else {
+    my $fh = *STDIN;
+    $delay ||= 60;
+    draw($fh);
+}
+
+sub draw {
+    my $fh = shift;
+    while ( my $line = <$fh> ) {
+        clear($line) or next;
+        my $color = undef;
+        if ( $line =~ m{warning|error|fail}i ) {
+            $color = "\e[91m";
+        }
+        else {
+            $color = "\e[90m";
+        }
+        if ( not @ARGV or $count > 1 ) {
+            chomp $line;
+            print $color, $line, "\e[0m\n";
+        }
+        else {
+            print $line;
+        }
+    }
+    return;
+}
+
+sub clear {
+    my $line  = shift;
+    my $clear = 1;
+    if ($winch) {
+        $winch  = undef;
+        $width  = `tput cols`;
+        $height = `tput lines`;
+    }
+    my $span = int( length($line) / $width + 1 );
+    $count += $span;
+    if ( @ARGV and $timestamp ) {
+        $clear = undef if ( $count >= $height );
+    }
+    elsif ( time - $timestamp > $delay or $count >= $height ) {
+        $count     = $span;
+        $timestamp = time;
+        print "\e[H\e[2J";
+    }
+    return $clear;
+}
