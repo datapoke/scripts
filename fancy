@@ -62,6 +62,7 @@ sub clear {
     my $line  = shift;
     my $clear = undef;
     my $rv    = 1;
+    my $now   = time;
     if ($Winch) {
         $Winch  = undef;
         $Width  = `tput cols`;
@@ -77,12 +78,12 @@ sub clear {
             $rv = undef if ( $Count >= $Height );
         }
     }
-    elsif ( time - $Timestamp > $Delay or $Count >= $Height ) {
-        $clear = 1;
+    elsif ( $now - $Timestamp > $Delay or $Count >= $Height ) {
+        $clear = $now - $Timestamp;
     }
     if ($clear) {
         $Count     = $span;
-        $Timestamp = time;
+        $Timestamp = $now;
         print "\e[H\e[2J";
     }
     return $rv;
