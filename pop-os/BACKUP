@@ -1,0 +1,14 @@
+#!/bin/sh
+
+mkdir -p $HOME/Documents/Config/pop-os
+cd $HOME/Documents/Config/pop-os
+ 
+sudo cp  -v /etc/crypttab                          etc/
+sudo cp  -v /etc/docker/daemon.json                etc/docker/
+sudo cp  -v /etc/fstab                             etc/
+sudo cp  -v /etc/hostname                          etc/
+sudo cp  -v /etc/hosts                             etc/
+sudo cp -rv /etc/luks-keys                         etc/
+sudo cp -rv /etc/NetworkManager/system-connections etc/NetworkManager/
+sudo cp -rv /etc/openvpn                           etc/openvpn
+sudo chown -R $USER:$USER etc/
