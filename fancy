@@ -44,6 +44,9 @@ sub draw {
         if ( $line =~ m{warning|error|fail}i ) {
             $color = "\e[91m";
         }
+        elsif ( $line =~ m{auth|ssh|sftp}i ) {
+            $color = "\e[92m";
+        }
         else {
             $color = "\e[90m";
         }
