@@ -41,8 +41,11 @@ sub draw {
     while ( my $line = <$fh> ) {
         clear($line) or next;
         my $color = undef;
-        if ( $line =~ m{warning|error|fail}i ) {
+        if ( $line =~ m{error|fail}i ) {
             $color = "\e[91m";
+        }
+        elsif ( $line =~ m{warning}i ) {
+            $color = "\e[43m\e[2K";
         }
         elsif ( $line =~ m{auth|ssh}i ) {
             $color = "\e[92m";
