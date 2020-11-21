@@ -45,7 +45,7 @@ sub draw {
             $color = "\e[91m";
         }
         elsif ( $line =~ m{warning}i ) {
-            $color = "\e[43m\e[2K";
+            $color = "\e[93m";
         }
         elsif ( $line =~ m{auth|ssh}i ) {
             $color = "\e[92m";
