@@ -94,6 +94,7 @@ sub clear {
         $Count     = $span;
         $Timestamp = $now;
         print "\e[H";
+        print "\e[2J" if (not @ARGV);
     }
     return $rv;
 }
