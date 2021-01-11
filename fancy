@@ -52,7 +52,7 @@ sub draw {
         }
         else {
             # $color = "\e[90m";
-            $color = '';
+            $color = "\e[0m";
         }
         if ( not @ARGV or $Count > 1 ) {
             chomp $line;
