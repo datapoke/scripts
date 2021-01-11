@@ -18,6 +18,8 @@ if ( @ARGV and $ARGV[0] =~ m{^-} ) {
     die "Usage: fancy [ -n <seconds> ] [ <command> ]\n" if ( not $r );
 }
 
+print "\e[H\e[2J";
+
 if (@ARGV) {
     while (1) {
         my $fh = undef;
@@ -56,7 +58,7 @@ sub draw {
         }
         if ( not @ARGV or $Count > 1 ) {
             chomp $line;
-            print $color, $line, "\e[0m\n";
+            print $color, $line, "\e[0m\e[K\n";
         }
         else {
             print $line;
@@ -91,7 +93,7 @@ sub clear {
     if ($clear) {
         $Count     = $span;
         $Timestamp = $now;
-        print "\e[H\e[2J";
+        print "\e[H";
     }
     return $rv;
 }
