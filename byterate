@@ -7,7 +7,8 @@ my $then  = time;
 my $delay = $ARGV[0] || 2;
 alarm $delay;
 local $SIG{ALRM} = sub {
-    my $span = time - $then;
+    my $now  = time;
+    my $span = $now - $then;
     if ( $size > 1024 * 1024 * $span ) {
         printf "%.2f MB per second\n", $size / ( 1024 * 1024 ) / $span;
     }
@@ -19,7 +20,7 @@ local $SIG{ALRM} = sub {
     }
     alarm $delay;
     $size = 0;
-    $then = time;
+    $then = $now;
 };
 my $buffer;
 $size += sysread( STDIN, $buffer, 65536 ) // 0 while (1);
