@@ -23,4 +23,4 @@ local $SIG{ALRM} = sub {
     $then = $now;
 };
 my $buffer;
-$size += sysread( STDIN, $buffer, 65536 ) while (1);
+$size += sysread( STDIN, $buffer, 65536 ) // 0 while (1);
