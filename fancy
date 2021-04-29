@@ -43,17 +43,22 @@ sub draw {
     while ( my $line = <$fh> ) {
         clear($line) or next;
         my $color = undef;
-        if ( $line =~ m{error|fail}i ) {
-            $color = "\e[91m";
+        if ( $line =~ m{error}i ) {
+            $color = "\e[30;101m";
         }
         elsif ( $line =~ m{warning}i ) {
-            $color = "\e[93m";
+            $color = "\e[30;103m";
+        }
+        elsif ( $line =~ m{fail}i ) {
+            $color = "\e[91m";
         }
         elsif ( $line =~ m{auth|ssh}i ) {
             $color = "\e[92m";
         }
+        elsif ( $line =~ m{info:|debug:}i ) {
+            $color = "\e[90m";
+        }
         else {
-            # $color = "\e[90m";
             $color = "\e[0m";
         }
         if ( not @ARGV or $Count > 1 ) {
