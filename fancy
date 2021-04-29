@@ -63,7 +63,7 @@ sub draw {
         }
         if ( not @ARGV or $Count > 1 ) {
             chomp $line;
-            print $color, $line, "\e[0m\e[K\n";
+            print $color, $line, "\e[0m\n";
         }
         else {
             print $line;
