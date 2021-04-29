@@ -43,20 +43,23 @@ sub draw {
     while ( my $line = <$fh> ) {
         clear($line) or next;
         my $color = undef;
-        if ( $line =~ m{error}i ) {
+        if ( $line =~ m{ERROR:} ) {
             $color = "\e[30;101m";
         }
-        elsif ( $line =~ m{warning}i ) {
+        elsif ( $line =~ m{WARNING:} ) {
             $color = "\e[30;103m";
         }
-        elsif ( $line =~ m{info:|debug:|systemd[[]}i ) {
+        elsif ( $line =~ m{INFO:|DEBUG:|systemd[[]} ) {
             $color = "\e[90m";
         }
         elsif ( $line =~ m{auth|ssh|sftp}i ) {
             $color = "\e[92m";
         }
-        elsif ( $line =~ m{fail}i ) {
+        elsif ( $line =~ m{fail|error}i ) {
             $color = "\e[91m";
+        }
+        elsif ( $line =~ m{warning}i ) {
+            $color = "\e[93m";
         }
         else {
             $color = "\e[0m";
