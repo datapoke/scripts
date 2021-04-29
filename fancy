@@ -49,11 +49,11 @@ sub draw {
         elsif ( $line =~ m{warning}i ) {
             $color = "\e[30;103m";
         }
-        elsif ( $line =~ m{auth|ssh|sftp}i ) {
-            $color = "\e[92m";
-        }
         elsif ( $line =~ m{info:|debug:|systemd[[]}i ) {
             $color = "\e[90m";
+        }
+        elsif ( $line =~ m{auth|ssh|sftp}i ) {
+            $color = "\e[92m";
         }
         elsif ( $line =~ m{fail}i ) {
             $color = "\e[91m";
