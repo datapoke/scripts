@@ -49,14 +49,14 @@ sub draw {
         elsif ( $line =~ m{warning}i ) {
             $color = "\e[30;103m";
         }
-        elsif ( $line =~ m{fail}i ) {
-            $color = "\e[91m";
-        }
         elsif ( $line =~ m{auth|ssh}i ) {
             $color = "\e[92m";
         }
         elsif ( $line =~ m{info:|debug:}i ) {
             $color = "\e[90m";
+        }
+        elsif ( $line =~ m{fail}i ) {
+            $color = "\e[91m";
         }
         else {
             $color = "\e[0m";
