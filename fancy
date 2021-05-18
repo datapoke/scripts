@@ -99,17 +99,10 @@ sub clear {
         $clear = $now - $Timestamp;
     }
     if ($clear) {
-        print "\e[H";
-        if ( not @ARGV ) {
-            print "\e[2J";
-            if ( $Count < $Height ) {
-                my $half = ( $Height - $Count ) / 2;
-                print "\n" x $half;
-                $span += $half;
-            }
-        }
         $Count     = $span;
         $Timestamp = $now;
+        print "\e[H";
+        print "\e[2J" if ( not @ARGV );
     }
     return $rv;
 }
