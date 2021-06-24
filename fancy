@@ -8,6 +8,9 @@ my $Count     = 1;
 my $Width     = `tput cols`;
 my $Height    = `tput lines`;
 my $Winch     = undef;
+my $Date_Fmt1 = qr{\w+ \d+ \d\d:\d\d:\d\d};
+my $Date_Fmt2 = qr{\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S+};
+my $Date_Re   = qr{$Date_Fmt1|$Date_Fmt2};
 local $SIG{WINCH} = sub { $Winch = 1 };
 
 if ( @ARGV and $ARGV[0] =~ m{^-} ) {
@@ -64,9 +67,22 @@ sub draw {
         else {
             $color = "\e[0m";
         }
+        $line =~ s/#033\[/\e[/g;
         if ( not @ARGV or $Count > 1 ) {
             chomp $line;
-            print $color, $line, "\e[0m\n";
+            if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
+                my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
+                printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+                    $date, $host, $process, $msg;
+            }
+            elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
+                my ( $date, $host, $msg ) = ( $1, $2, $3 );
+                printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
+                    $date, $host, $msg;
+            }
+            else {
+                print $color, $line, "\e[0m\n";
+            }
         }
         else {
             print $line;
