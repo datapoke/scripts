@@ -37,14 +37,14 @@ if (@ARGV) {
 }
 else {
     my $fh = *STDIN;
-    $Delay ||= 900;
+    $Delay //= 0;
     draw($fh);
 }
 
 sub draw {
     my $fh = shift;
     while ( my $line = <$fh> ) {
-        clear($line) or next;
+        clear($line) or next if ($Delay);
         my $color = undef;
         if ( $line =~ m{ERROR:} ) {
             $color = "\e[30;101m";
