@@ -68,6 +68,7 @@ sub draw {
             $color = "\e[0m";
         }
         $line =~ s/#033\[/\e[/g;
+        $line =~ s/\\x2d/-/g;
         if ( not @ARGV or $Count > 1 ) {
             chomp $line;
             if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
