@@ -69,24 +69,19 @@ sub draw {
         }
         $line =~ s/#033\[/\e[/g;
         $line =~ s/\\x2d/-/g;
-        if ( not @ARGV or $Count > 1 ) {
-            chomp $line;
-            if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
-                my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
-                printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
-                    $date, $host, $process, $msg;
-            }
-            elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
-                my ( $date, $host, $msg ) = ( $1, $2, $3 );
-                printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
-                    $date, $host, $msg;
-            }
-            else {
-                print $color, $line, "\e[0m\n";
-            }
+        chomp $line;
+        if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
+            my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
+            printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+                $date, $host, $process, $msg;
+        }
+        elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
+            my ( $date, $host, $msg ) = ( $1, $2, $3 );
+            printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
+                $date, $host, $msg;
         }
         else {
-            print $line;
+            print $color, $line, "\e[0m\n";
         }
     }
     return;
