@@ -104,10 +104,12 @@ sub get_color {
     my $line  = shift;
     my $color = undef;
     if ( $line =~ m{ERROR:} ) {
-        $color = "\e[30;101m";
+        #$color = "\e[30;101m";
+        $color = "\e[91m";
     }
     elsif ( $line =~ m{WARNING:} ) {
-        $color = "\e[30;103m";
+        #$color = "\e[30;103m";
+        $color = "\e[93m";
     }
     elsif ( $line =~ m{INFO:|DEBUG:|systemd[[]} ) {
         $color = "\e[90m";
