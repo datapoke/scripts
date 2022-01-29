@@ -1,0 +1,9 @@
+#!/bin/sh -ex
+filename=$1
+if [ -z "$filename" ] ; then
+    echo missing argument
+    exit 1
+fi
+newname=$(echo ${filename} | sed 's/.enc$//')
+openssl enc -aes-256-cbc -pbkdf2 -d -in ${filename} -out ${newname}
+chmod 600 ${filename}
