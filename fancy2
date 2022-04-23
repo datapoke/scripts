@@ -1,0 +1,109 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+use Getopt::Long qw( GetOptions );
+my $Delay     = 2;
+my $Timestamp = 0;
+my $Count     = 1;
+my $Width     = `tput cols`;
+my $Height    = `tput lines`;
+my $Winch     = undef;
+my @Buffer    = ();
+my $Date_Fmt1 = qr{\w+ +\d+ \d\d:\d\d:\d\d};
+my $Date_Fmt2 = qr{\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S+};
+my $Date_Re   = qr{$Date_Fmt1|$Date_Fmt2};
+local $SIG{WINCH} = sub { $Winch = 1 };
+
+my $r = GetOptions( 'n=i' => \$Delay );
+die "Usage: fancy2 [ -n <seconds> ]\n" if ( not $r );
+
+my $fh = *STDIN;
+$Delay //= 1;
+draw($fh);
+
+sub draw {
+    my $fh = shift;
+    while ( my $line = <$fh> ) {
+        buffer($line);
+    }
+    return;
+}
+
+sub buffer {
+    my $line  = shift;
+    my $flush = undef;
+    my $now   = time;
+    if ($Winch) {
+        $Winch  = undef;
+        $Width  = `tput cols`;
+        $Height = `tput lines`;
+    }
+    my $span = int( length($line) / $Width + 1 );
+    $Count += $span;
+    if ( $now - $Timestamp > $Delay or $Count >= $Height ) {
+        $flush = $now - $Timestamp;
+    }
+    if ($flush) {
+        $Count     = $span;
+        $Timestamp = $now;
+        fancify($_) for (@Buffer);
+        @Buffer = ();
+    }
+    else {
+        push @Buffer, $line;
+    }
+    return;
+}
+
+sub fancify {
+    my $line = shift;
+    $line =~ s/#033\[/\e[/g;
+    $line =~ s/\\x2d/-/g;
+    chomp $line;
+    if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
+        my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
+        my $color = get_color($msg);
+        printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+            $date, $host, $process, $msg;
+    }
+    elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
+        my ( $date, $host, $msg ) = ( $1, $2, $3 );
+        my $color = get_color($msg);
+        printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
+            $date, $host, $msg;
+    }
+    else {
+        my $color = get_color($line);
+        print $color, $line, "\e[0m\n";
+    }
+    return;
+}
+
+sub get_color {
+    my $line  = shift;
+    my $color = undef;
+    if ( $line =~ m{ERROR:} ) {
+        #$color = "\e[30;101m";
+        $color = "\e[91m";
+    }
+    elsif ( $line =~ m{WARNING:} ) {
+        #$color = "\e[30;103m";
+        $color = "\e[93m";
+    }
+    elsif ( $line =~ m{INFO:|DEBUG:|systemd[[]} ) {
+        $color = "\e[90m";
+    }
+    elsif ( $line =~ m{auth|ssh|sftp}i ) {
+        $color = "\e[92m";
+    }
+    elsif ( $line =~ m{fail|error}i ) {
+        $color = "\e[91m";
+    }
+    elsif ( $line =~ m{warning}i ) {
+        $color = "\e[93m";
+    }
+    else {
+        $color = "\e[0m";
+    }
+    return $color;
+}
