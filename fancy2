@@ -24,7 +24,12 @@ draw($fh);
 sub draw {
     my $fh = shift;
     while ( my $line = <$fh> ) {
-        buffer($line);
+        if ($Delay) {
+            buffer($line);
+        }
+        else {
+            fancify($line);
+        }
     }
     return;
 }
