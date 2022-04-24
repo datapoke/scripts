@@ -2,7 +2,7 @@
 use warnings;
 use strict;
 use Getopt::Long qw( GetOptions );
-my $Delay     = 2;
+my $Delay     = undef;
 my $Timestamp = 0;
 my $Count     = 1;
 my $Width     = `tput cols`;
@@ -18,7 +18,7 @@ my $r = GetOptions( 'n=i' => \$Delay );
 die "Usage: fancy2 [ -n <seconds> ]\n" if ( not $r );
 
 my $fh = *STDIN;
-$Delay //= 1;
+$Delay //= 0;
 draw($fh);
 
 sub draw {
