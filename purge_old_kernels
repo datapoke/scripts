@@ -1,0 +1,10 @@
+#!/bin/sh -ex
+version=$1
+if [ -z "${version}" ] ; then
+    echo "specify a kernel version to keep"
+    exit 1
+fi
+cd /lib/modules
+for d in $(ls | grep -v $version) ; do dpkg -S $d > /dev/null || sudo rm -rf $d ; done
+for d in $(ls | grep -v $version) ; do sudo apt purge -y linux-*-$d ; done
+for d in $(ls | grep -v $version) ; do dpkg -S $d > /dev/null || sudo rm -rf $d ; done
