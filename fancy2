@@ -11,7 +11,8 @@ my $Winch     = undef;
 my @Buffer    = ();
 my $Date_Fmt1 = qr{\w+ +\d+ \d\d:\d\d:\d\d};
 my $Date_Fmt2 = qr{\d{4}-\d\d-\d\d \d\d:\d\d:\d\d \S+};
-my $Date_Re   = qr{$Date_Fmt1|$Date_Fmt2};
+my $Date_Fmt3 = qr{\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d-\d\d:\d\d \S+};
+my $Date_Re   = qr{$Date_Fmt1|$Date_Fmt2|$Date_Fmt3};
 local $SIG{WINCH} = sub { $Winch = 1 };
 
 my $r = GetOptions( 'n=i' => \$Delay );
