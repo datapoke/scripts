@@ -101,7 +101,7 @@ sub get_color {
     }
     elsif ( $$line =~ m{auth|ssh|sftp}i ) {
         $color = "\e[92m";
-        $$line =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[30;102m$2\e[0m$color}i;
+        $$line =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[0m$2$color}i;
     }
     elsif ( $$line =~ m{fail|error}i ) {
         $color = "\e[91m";
