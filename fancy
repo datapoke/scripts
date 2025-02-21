@@ -44,29 +44,42 @@ else {
 
 sub draw {
     my $fh = shift;
-    while ( my $line = <$fh> ) {
-        clear($line) or next if ($Delay);
-        $line =~ s{#033\[}{\e[}g;
-        $line =~ s{\\x2d}{-}g;
-        chomp $line;
-        if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
-            my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
-            my $color = get_color(\$msg);
-            printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
-                $date, $host, $process, $msg;
+    if ($Delay) {
+        my @lines = <$fh>;
+        for my $line (@lines) {
+            clear($line) or next;
+            draw_line($line);
         }
-        elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
-            my ( $date, $host, $msg ) = ( $1, $2, $3 );
-            my $color = get_color(\$msg);
-            printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
-                $date, $host, $msg;
-        }
-        else {
-            my $color = get_color(\$line);
-            print $color, $line, "\e[0m\n";
+    }
+    else {
+        while ( my $line = <$fh> ) {
+            draw_line($line);
         }
     }
     return;
+}
+
+sub draw_line {
+    my $line = shift;
+    $line =~ s{#033\[}{\e[}g;
+    $line =~ s{\\x2d}{-}g;
+    chomp $line;
+    if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
+        my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
+        my $color = get_color(\$msg);
+        printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+            $date, $host, $process, $msg;
+    }
+    elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
+        my ( $date, $host, $msg ) = ( $1, $2, $3 );
+        my $color = get_color(\$msg);
+        printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
+            $date, $host, $msg;
+    }
+    else {
+        my $color = get_color(\$line);
+        print $color, $line, "\e[0m\n";
+    }
 }
 
 sub clear {
@@ -90,7 +103,7 @@ sub clear {
         }
     }
     elsif ( $now - $Timestamp > $Delay or $Count >= $Height ) {
-        $clear = $now - $Timestamp;
+        $clear = 1;
     }
     if ($clear) {
         $Count     = $span;
