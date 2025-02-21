@@ -5,6 +5,8 @@ my $count = 0;
 my $min   = undef;
 my $max   = 0;
 my $avg   = 0;
+my $verbose = 0;
+$verbose = shift(@ARGV) if ($ARGV[0] and $ARGV[0] eq '-v');
 while (<>) {
     my $n = (m(([\d.]+)))[0];
     next if (not defined $n);
@@ -12,6 +14,7 @@ while (<>) {
     $count++;
     $min = $n if (not defined $min or $n < $min);
     $max = $n if ($n > $max);
+    print if ($verbose);
 }
 $avg = $total / $count;
 print "min: $min; max: $max; avg: $total / $count = $avg\n";
