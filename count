@@ -16,5 +16,6 @@ while (<>) {
     $max = $n if ($n > $max);
     print if ($verbose);
 }
-$avg = $total / $count;
+$min //= 0;
+$avg = $total / $count if ($count);
 print "min: $min; max: $max; avg: $total / $count = $avg\n";

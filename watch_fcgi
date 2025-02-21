@@ -1,2 +1,2 @@
 #!/bin/sh
-ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | awk '{print $1" "$11" "$12}' | sort | uniq -c | sort -nr | ~/bin/count -v
+ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | sed -E 's/\(idle\) ([^ ]*)/\1 (idle)/' | awk '{print $1" "$11" "$12}' | sort | uniq -c | column -t |  ~/bin/count -v
