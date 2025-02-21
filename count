@@ -1,0 +1,17 @@
+#!/usr/bin/perl -w
+use strict;
+my $total = 0;
+my $count = 0;
+my $min   = undef;
+my $max   = 0;
+my $avg   = 0;
+while (<>) {
+    my $n = (m(([\d.]+)))[0];
+    next if (not defined $n);
+    $total += $n;
+    $count++;
+    $min = $n if (not defined $min or $n < $min);
+    $max = $n if ($n > $max);
+}
+$avg = $total / $count;
+print "min: $min; max: $max; avg: $total / $count = $avg\n";
