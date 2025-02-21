@@ -1,0 +1,27 @@
+#!/bin/sh
+args=`getopt v $*`
+if [ $? != 0 ]
+then
+	echo "Usage: $0 [-v] <pattern>"
+	echo "	-v verbose"
+	exit 2
+fi
+
+set -- $args
+for i
+do
+	case "$i"
+	in
+		-v)
+			verbose=1; shift;;
+		--)
+			shift; break;;
+	esac
+done
+pattern=$1
+
+if [ $verbose -eq 1 ] ; then
+    ps auxwww | grep $pattern | grep -v -e fancy -e watch_fcgi | sed -E 's/\([^ ]*\)//g' | awk '{print $1" "$11" "$12}' | sort | uniq -c | total -v | column -t
+else
+    ps auxwww | grep $pattern | grep -v -e fancy -e watch_fcgi | sed -E 's/\([^ ]*\)//g' | awk '{print $1}' | sort | uniq -c | total -v | column -t
+fi
