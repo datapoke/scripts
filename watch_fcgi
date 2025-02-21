@@ -1,0 +1,2 @@
+#!/bin/sh
+ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | awk '{print $1" "$11" "$12}' | sort | uniq -c | sort -nr | ~/bin/count -v
