@@ -1,6 +1,6 @@
 #!/bin/sh
 if [ "$1" = "-v" ] ; then
-    ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | sed -E 's/\(idle\) ([^ ]*)/\1 (idle)/' | awk '{print $1" "$11" "$12}' | sort | uniq -c | total -v | column -t
+    ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | sed -E 's/\([^ ]*\)//g' | awk '{print $1" "$11" "$12}' | sort | uniq -c | total -v | column -t
 else
-    ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | sed -E 's/\(idle\) ([^ ]*)/\1 (idle)/' | awk '{print $1}' | sort | uniq -c | total -v | column -t
+    ps auxwww | grep "[f]cgi" | grep -v -e fancy -e watch_fcgi | sed -E 's/\([^ ]*\)//g' | awk '{print $1}' | sort | uniq -c | total -v | column -t
 fi
