@@ -13,14 +13,14 @@ do
 	case "$i"
 	in
 		-v)
-			verbose=1; shift;;
+			verbose=true; shift;;
 		--)
 			shift; break;;
 	esac
 done
 pattern=$1
 
-if [ $verbose -eq 1 ] ; then
+if [ "${verbose}" = "true" ] ; then
     ps auxwww \
         | grep $pattern \
         | grep -v -e fancy -e watch_proc -e grep \
