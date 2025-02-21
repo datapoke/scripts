@@ -1,0 +1,12 @@
+#!/usr/bin/perl -w
+use strict;
+my $total = 0;
+my $verbose = 0;
+$verbose = shift(@ARGV) if ($ARGV[0] and $ARGV[0] eq '-v');
+while (<>) {
+    my $n = (m(([\d.]+)))[0];
+    next if (not defined $n);
+    $total += $n;
+    print if ($verbose);
+}
+print $total, $verbose ? " total\n" : "\n";
