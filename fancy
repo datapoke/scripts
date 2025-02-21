@@ -44,11 +44,15 @@ else {
 
 sub draw {
     my $fh = shift;
-    if ($Delay) {
+    if (@ARGV) {
         my @lines = <$fh>;
         for my $line (@lines) {
             clear($line) or next;
             draw_line($line);
+        }
+        if ($Count < $Height - 1) {
+            # print empty space to fill the screen
+            print "\e[2K\n" x ( $Height - $Count - 1);
         }
     }
     else {
@@ -67,18 +71,18 @@ sub draw_line {
     if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
         my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
         my $color = get_color(\$msg);
-        printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+        printf "\e[2K\r\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
             $date, $host, $process, $msg;
     }
     elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
         my ( $date, $host, $msg ) = ( $1, $2, $3 );
         my $color = get_color(\$msg);
-        printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
+        printf "\e[2K\r\e[95m%s \e[96m%s $color%s\e[0m\n",
             $date, $host, $msg;
     }
     else {
         my $color = get_color(\$line);
-        print $color, $line, "\e[0m\n";
+        print "\e[2K\r", $color, $line, "\e[0m\n";
     }
 }
 
@@ -92,7 +96,7 @@ sub clear {
         $Width  = `tput cols`;
         $Height = `tput lines`;
     }
-    my $span = int( length($line) / $Width + 1 );
+    my $span = int( length($line) / $Width+ 1 );
     $Count += $span;
     if (@ARGV) {
         if ( not $Timestamp ) {
@@ -109,7 +113,7 @@ sub clear {
         $Count     = $span;
         $Timestamp = $now;
         print "\e[H";
-        print "\e[2J";
+        print "\e[2J" if (not @ARGV);
     }
     return $rv;
 }
