@@ -96,7 +96,7 @@ sub clear {
         $Width  = `tput cols`;
         $Height = `tput lines`;
     }
-    my $span = int( length($line) / $Width+ 1 );
+    my $span = int( length($line) / $Width + 1 );
     $Count += $span;
     if (@ARGV) {
         if ( not $Timestamp ) {
