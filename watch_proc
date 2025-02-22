@@ -191,6 +191,36 @@ sub get_proc_args {
     return $args;
 }
 
+sub print_table {
+    my ($table)    = @_;
+    my $used       = 1;
+    my @max        = ();
+    my @format     = ();
+    for my $row ( 0 .. $#{ $table } ) {
+        for my $col ( 0 .. $#{ $table->[$row] } ) {
+            $max[$col] = length $table->[$row]->[$col]
+                if ( length $table->[$row]->[$col] > ( $max[$col] || 0 ) );
+        }
+    }
+    for my $col ( 0 .. $#max ) {
+        push @format, join q(), q(%-), $col < $#max ? $max[$col] : q(), 's';
+    }
+    my $format = join( q( ), "\e[2K", @format ) . "\n";
+    print "\e[H\e[2J";
+    my $output = q();
+    for my $row ( @{$table} ) {
+        my $line = sprintf $format, @{$row};
+        $used  += int( ( length $line ) / $Width + 1 );
+        print $line if $used < $Height - 1;
+    }
+
+    # print empty space to fill the screen
+    if ( $used < $Height - 1 ) {
+        print "\e[2K\n" x ( $Height - $used - 1 );
+    }
+    return;
+}
+
 # loop
 while (1) {
 
@@ -215,7 +245,7 @@ while (1) {
     for my $proc (@procs) {
         my $key =
             $verbose
-            ? sprintf( "%-${max}s  %s", $proc->{user}, $proc->{args} )
+            ? sprintf( "%-${max}s %s", $proc->{user}, $proc->{args} )
             : $proc->{user};
         next if $proc->{args}     =~ /watch_proc/;
         next unless $proc->{args} =~ /$pattern/;
@@ -224,20 +254,14 @@ while (1) {
 
     # print results
     my $total = 0;
-    my $used  = 1;
-    print "\e[H\e[2J";
+    my @table = ();
     for my $key ( sort keys %count ) {
-        my $line = sprintf "\e[2K%4d  %s\n", $count{$key}, $key;
-        print $line if ( $used < $Height - 1 );
+        push @table, [ $count{$key}, split q( ), $key ];
         $total += $count{$key};
-        $used  += int( ( length $line ) / $Width + 1 );
     }
-    printf "\e[2K%4d  %s\n", $total, 'total';
+    push @table, [ $total, 'total' ];
 
-    if ( $used < $Height - 1 ) {
+    print_table(\@table);
 
-        # print empty space to fill the screen
-        print "\e[2K\n" x ( $Height - $used - 1 );
-    }
-    sleep 1;
+    sleep $delay;
 }
