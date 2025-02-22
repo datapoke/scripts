@@ -71,18 +71,18 @@ sub draw_line {
     if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
         my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
         my $color = get_color(\$msg);
-        printf "\e[2K\r\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
+        printf "\e[2K\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
             $date, $host, $process, $msg;
     }
     elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
         my ( $date, $host, $msg ) = ( $1, $2, $3 );
         my $color = get_color(\$msg);
-        printf "\e[2K\r\e[95m%s \e[96m%s $color%s\e[0m\n",
+        printf "\e[2K\e[95m%s \e[96m%s $color%s\e[0m\n",
             $date, $host, $msg;
     }
     else {
         my $color = get_color(\$line);
-        print "\e[2K\r", $color, $line, "\e[0m\n";
+        print "\e[2K", $color, $line, "\e[0m\n";
     }
 }
 

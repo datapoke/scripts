@@ -192,10 +192,10 @@ sub get_proc_args {
 }
 
 sub print_table {
-    my ($table)    = @_;
-    my $used       = 1;
-    my @max        = ();
-    my @format     = ();
+    my ($table, $total) = @_;
+    my $used            = 1;
+    my @max             = ( length $total );
+    my @format          = ();
     for my $row ( 0 .. $#{ $table } ) {
         for my $col ( 0 .. $#{ $table->[$row] } ) {
             $max[$col] = length $table->[$row]->[$col]
@@ -203,16 +203,16 @@ sub print_table {
         }
     }
     for my $col ( 0 .. $#max ) {
-        push @format, join q(), q(%-), $col < $#max ? $max[$col] : q(), 's';
+        push @format, join q(), q(%-), ($col < $#max) ? $max[$col] : q(), 's';
     }
-    my $format = join( q( ), "\e[2K", @format ) . "\n";
+    my $format = "\e[2K" . join( q( ), @format ) . "\n";
     print "\e[H\e[2J";
-    my $output = q();
     for my $row ( @{$table} ) {
-        my $line = sprintf $format, @{$row};
-        $used  += int( ( length $line ) / $Width + 1 );
+        my $line = sprintf $format, @{$row}, map q(), $#{$row} .. $#max;
+        $used += int( ( length $line ) / $Width + 1 );
         print $line if $used < $Height - 1;
     }
+    printf $format, $total, 'total', map q(), 1 .. $#max;
 
     # print empty space to fill the screen
     if ( $used < $Height - 1 ) {
@@ -259,9 +259,8 @@ while (1) {
         push @table, [ $count{$key}, split q( ), $key ];
         $total += $count{$key};
     }
-    push @table, [ $total, 'total' ];
 
-    print_table(\@table);
+    print_table(\@table, $total);
 
     sleep $delay;
 }
