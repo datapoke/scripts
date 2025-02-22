@@ -79,7 +79,7 @@ sub get_procs_linux {
             };
     }
     closedir($dh);
-    return @procs;
+    return \@procs;
 }
 
 sub get_procs_freebsd {
@@ -100,10 +100,12 @@ sub get_procs_freebsd {
         undef,           # no new value
         0                # no new length
     );
-    die sprintf( 'sysctl size failed: %d %s', $!, $! ) if $ret == -1;
+    # die sprintf( 'sysctl size failed: %d %s', $!, $! ) if $ret == -1;
+    return [] if $ret == -1;
 
     my $bufsize = unpack( 'i', $size );
-    die 'Invalid size' unless $bufsize > 0;
+    # die 'Invalid size' unless $bufsize > 0;
+    return [] unless $bufsize > 0;
 
     # allocate buffer and get data
     my $data = "\0" x $bufsize;
@@ -116,7 +118,8 @@ sub get_procs_freebsd {
         undef,
         0
     );
-    die sprintf( 'sysctl data failed: %d %s', $!, $! ) if $ret == -1;
+    # die sprintf( 'sysctl data failed: %d %s', $!, $! ) if $ret == -1;
+    return [] if $ret == -1;
 
     # parse process entries
     for ( my $pos = 0; $pos < $bufsize; $pos += KINFO_PROC_SIZE ) {
@@ -145,7 +148,7 @@ sub get_procs_freebsd {
             cmd  => $comm
             };
     }
-    return @procs;
+    return \@procs;
 }
 
 # use SYS___sysctl KERN_PROC_ARGS to get process args
@@ -225,7 +228,7 @@ sub print_table {
 while (1) {
 
     # get process list
-    my @procs = get_procs();
+    my $procs = get_procs();
 
     # resize
     if ($Winch) {
@@ -236,13 +239,13 @@ while (1) {
 
     # get max width of username
     my $max = 0;
-    for my $proc (@procs) {
+    for my $proc (@$procs) {
         $max = length $proc->{user} if length $proc->{user} > $max;
     }
 
     # filter and count processes
     my %count = ();
-    for my $proc (@procs) {
+    for my $proc (@$procs) {
         my $key =
             $verbose
             ? sprintf( "%-${max}s %s", $proc->{user}, $proc->{args} )
