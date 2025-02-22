@@ -2,79 +2,81 @@
 use strict;
 use warnings;
 use Getopt::Long;
-use POSIX;
-use Encode qw(decode encode);
 
-if ($^O eq 'freebsd') {
+if ( $^O eq 'freebsd' ) {
     require 'sys/syscall.ph';
     require 'sys/sysctl.ph';
 }
 
 # get command line args
 my $verbose = 0;
-GetOptions('verbose|v' => \$verbose) or die "Usage: $0 [-v] <pattern>\n";
-my $pattern = shift @ARGV or die "Usage: $0 [-v] <pattern>\n";
-
-my $Winch  = undef;
-my $Width  = `tput cols`;
-my $Height = `tput lines`;
+my $delay   = 1;
+GetOptions(
+    'verbose|v' => \$verbose,
+    'delay|d=i' => \$delay
+) or die "Usage: $0 [-v] [-d <seconds>] <pattern>\n";
+my $pattern = shift @ARGV || '.';
+my $Winch   = undef;
+my $Width   = `tput cols`;
+my $Height  = `tput lines`;
 local $SIG{WINCH} = sub { $Winch = 1 };
 
 use constant {
-    KINFO_PROC_SIZE => 1088,  # size of kinfo_proc struct
-    ARGS_OFFSET => 8,         # offset to arguments
-    PID_OFFSET => 72,         # offset to pid in kinfo_proc
-    UID_OFFSET => 168,        # offset to uid in kinfo_proc
-    COMM_OFFSET => 447,       # offset to command name
-    PARGS_LENGTH_OFFSET => 4, # offset to length of arguments
+    KINFO_PROC_SIZE     => 1088,    # size of kinfo_proc struct
+    ARGS_OFFSET         => 8,       # offset to arguments
+    PID_OFFSET          => 72,      # offset to pid in kinfo_proc
+    UID_OFFSET          => 168,     # offset to uid in kinfo_proc
+    COMM_OFFSET         => 447,     # offset to command name
+    PARGS_LENGTH_OFFSET => 4,       # offset to length of arguments
 };
 
 # Get process list - platform specific implementation
 sub get_procs {
-    if ($^O eq 'freebsd') {
+    if ( $^O eq 'freebsd' ) {
         return get_procs_freebsd();
     }
     else {
-        return get_procs_linux(); 
+        return get_procs_linux();
     }
 }
 
 sub get_procs_linux {
     my @procs;
-    
+
     # Read /proc directory
-    opendir(my $dh, '/proc') or die "Can't open /proc: $!";
-    while (my $pid = readdir($dh)) {
+    opendir( my $dh, '/proc' ) or die "Can't open /proc: $!";
+    while ( my $pid = readdir($dh) ) {
         next unless $pid =~ /^\d+$/;
-        
+
         # Read process status
-        open(my $fh, '<', "/proc/$pid/status") or next;
-        my ($uid, $name);
+        open( my $fh, '<', "/proc/$pid/status" ) or next;
+        my ( $uid, $name );
         while (<$fh>) {
-            $uid = $1 if /^Uid:\s+(\d+)/;
+            $uid  = $1 if /^Uid:\s+(\d+)/;
             $name = $1 if /^Name:\s+(.+)/;
         }
         close $fh;
         next unless defined $uid;
-        
+
         # Get username
-        my @pw = getpwuid($uid);
+        my @pw   = getpwuid($uid);
         my $user = @pw ? $pw[0] : 'unknown';
-        
+
         # Get command line
-        open($fh, '<', "/proc/$pid/cmdline") or next;
+        open( $fh, '<', "/proc/$pid/cmdline" ) or next;
         my $args = do { local $/; <$fh> };
         close $fh;
-        
-        $args =~ s/\0/ /g;  # Replace null bytes with spaces
-        $args ||= $name;    # Use process name if no command line
-        
-        push @procs, {
+
+        $args =~ s/\0/ /g;    # Replace null bytes with spaces
+        $args ||= $name;      # Use process name if no command line
+
+        push @procs,
+            {
             pid  => $pid,
             args => $args,
             user => $user,
             cmd  => $name
-        };
+            };
     }
     closedir($dh);
     return @procs;
@@ -82,60 +84,66 @@ sub get_procs_linux {
 
 sub get_procs_freebsd {
     my @procs;
-    
+
     # create stable storage for MIB and size
-    my @mib = (&CTL_KERN, &KERN_PROC, &KERN_PROC_ALL);
-    my $mib_buf = pack('i3', @mib);
-    my $size = pack('i', 0);
-    
+    my @mib     = ( &CTL_KERN, &KERN_PROC, &KERN_PROC_ALL );
+    my $mib_buf = pack( 'i3', @mib );
+    my $size    = pack( 'i',  0 );
+
     # get required size
-    my $ret = syscall(&SYS___sysctl,
-        $mib_buf,          # MIB array
-        scalar(@mib),      # MIB length 
-        undef,             # no buffer yet
-        $size,             # size pointer
-        undef,             # no new value
-        0                  # no new length
+    my $ret = syscall(
+        &SYS___sysctl,
+        $mib_buf,        # MIB array
+        scalar(@mib),    # MIB length
+        undef,           # no buffer yet
+        $size,           # size pointer
+        undef,           # no new value
+        0                # no new length
     );
-    die sprintf('sysctl size failed: %d %s', $!, $!) if $ret == -1;
-    
-    my $bufsize = unpack('i', $size);
+    die sprintf( 'sysctl size failed: %d %s', $!, $! ) if $ret == -1;
+
+    my $bufsize = unpack( 'i', $size );
     die 'Invalid size' unless $bufsize > 0;
-    
+
     # allocate buffer and get data
     my $data = "\0" x $bufsize;
-    $ret = syscall(&SYS___sysctl,
+    $ret = syscall(
+        &SYS___sysctl,
         $mib_buf,
         scalar(@mib),
-        $data,           # data buffer
-        $size,           # size pointer
+        $data,    # data buffer
+        $size,    # size pointer
         undef,
         0
     );
-    die sprintf('sysctl data failed: %d %s', $!, $!) if $ret == -1;
-    
+    die sprintf( 'sysctl data failed: %d %s', $!, $! ) if $ret == -1;
+
     # parse process entries
-    for (my $pos = 0; $pos < $bufsize; $pos += KINFO_PROC_SIZE) {
-        my ($args_ptr, $pid, $uid, $comm) = unpack('x' . ARGS_OFFSET . 'L x' .
-            (PID_OFFSET - ARGS_OFFSET - 4) . 'L x' .
-            (UID_OFFSET - PID_OFFSET - 4) . 'L x' .
-            (COMM_OFFSET - UID_OFFSET - 4) . 'Z20',
-            substr($data, $pos, KINFO_PROC_SIZE));
-            
+    for ( my $pos = 0; $pos < $bufsize; $pos += KINFO_PROC_SIZE ) {
+        my ( $args_ptr, $pid, $uid, $comm ) = unpack(
+            'x'
+                . ARGS_OFFSET . 'L x'
+                . ( PID_OFFSET - ARGS_OFFSET - 4 ) . 'L x'
+                . ( UID_OFFSET - PID_OFFSET - 4 ) . 'L x'
+                . ( COMM_OFFSET - UID_OFFSET - 4 ) . 'Z20',
+            substr( $data, $pos, KINFO_PROC_SIZE )
+        );
+
         # skip invalid entries
         next unless $pid && defined $uid && defined $comm;
-        
+
         # get username
-        my @pw = getpwuid($uid);
+        my @pw   = getpwuid($uid);
         my $user = @pw ? $pw[0] : 'unknown';
         my $args = get_proc_args($pid) or next;
-        
-        push @procs, {
+
+        push @procs,
+            {
             pid  => $pid,
             args => $args,
             user => $user,
             cmd  => $comm
-        };
+            };
     }
     return @procs;
 }
@@ -143,47 +151,52 @@ sub get_procs_freebsd {
 # use SYS___sysctl KERN_PROC_ARGS to get process args
 sub get_proc_args {
     my $pid = shift;
-    
-    # create MIB for sysctl
-    my @mib = (&CTL_KERN, &KERN_PROC, &KERN_PROC_ARGS, $pid);
-    my $mib_buf = pack('i4', @mib);
-    my $size = pack('i', 0);
-    
-    # get required size
-    my $ret = syscall(&SYS___sysctl,
-        $mib_buf,          # MIB array
-        scalar(@mib),      # MIB length 
-        undef,             # no buffer yet
-        $size,             # size pointer
-        undef,
-        0
-    );
-    return if $ret == -1;
-    # die sprintf('sysctl size failed: %d %s', $!, $!) if $ret == -1;
-    
-    my $bufsize = unpack('i', $size);
-    die 'Invalid size' unless $bufsize > 0;
 
-    # allocate buffer and get data
-    my $data = "\0" x $bufsize;
-    $ret = syscall(&SYS___sysctl,
-        $mib_buf,
-        scalar(@mib),
-        $data,           # data buffer
+    # create MIB for sysctl
+    my @mib     = ( &CTL_KERN, &KERN_PROC, &KERN_PROC_ARGS, $pid );
+    my $mib_buf = pack( 'i4', @mib );
+    my $size    = pack( 'i',  0 );
+
+    # get required size
+    my $ret = syscall(
+        &SYS___sysctl,
+        $mib_buf,        # MIB array
+        scalar(@mib),    # MIB length
+        undef,           # no buffer yet
         $size,           # size pointer
         undef,
         0
     );
-    die sprintf('sysctl data failed: %d %s', $!, $!) if $ret == -1;
+    return if $ret == -1;
+
+    # die sprintf('sysctl size failed: %d %s', $!, $!) if $ret == -1;
+
+    my $bufsize = unpack( 'i', $size );
+    die 'Invalid size' unless $bufsize > 0;
+
+    # allocate buffer and get data
+    my $data = "\0" x $bufsize;
+    $ret = syscall(
+        &SYS___sysctl,
+        $mib_buf,
+        scalar(@mib),
+        $data,    # data buffer
+        $size,    # size pointer
+        undef,
+        0
+    );
+    die sprintf( 'sysctl data failed: %d %s', $!, $! ) if $ret == -1;
+
     # return if $ret == -1;
-    my $args = unpack('Z*', $data);
+    my $args = unpack( 'Z*', $data );
     $args =~ s/^[(].*?[)] //;
     return $args;
 }
 
 # loop
 while (1) {
-    # get process list 
+
+    # get process list
     my @procs = get_procs();
 
     # resize
@@ -202,27 +215,31 @@ while (1) {
     # filter and count processes
     my %count = ();
     for my $proc (@procs) {
-        my $key = $verbose ? sprintf("%-${max}s  %s", $proc->{user}, $proc->{args}) : $proc->{user};
-        next if $proc->{args} =~ /watch_proc/;
+        my $key =
+            $verbose
+            ? sprintf( "%-${max}s  %s", $proc->{user}, $proc->{args} )
+            : $proc->{user};
+        next if $proc->{args}     =~ /watch_proc/;
         next unless $proc->{args} =~ /$pattern/;
         $count{$key}++;
     }
 
     # print results
-    my $total = 0; 
+    my $total = 0;
     my $used  = 1;
     print "\e[H\e[2J";
-    for my $key (sort keys %count) {
+    for my $key ( sort keys %count ) {
         my $line = sprintf "\e[2K%4d  %s\n", $count{$key}, $key;
-        print $line if ($used < $Height - 1);
+        print $line if ( $used < $Height - 1 );
         $total += $count{$key};
-        $used += int( ( length $line ) / $Width + 1 );
+        $used  += int( ( length $line ) / $Width + 1 );
     }
     printf "\e[2K%4d  %s\n", $total, 'total';
 
-    if ($used < $Height - 1) {
+    if ( $used < $Height - 1 ) {
+
         # print empty space to fill the screen
-        print "\e[2K\n" x ( $Height - $used - 1);
+        print "\e[2K\n" x ( $Height - $used - 1 );
     }
     sleep 1;
 }
