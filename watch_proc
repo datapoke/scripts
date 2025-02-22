@@ -64,7 +64,8 @@ sub get_procs_linux {
 
         # Get command line
         open( $fh, '<', "/proc/$pid/cmdline" ) or next;
-        my $args = do { local $/; <$fh> };
+        my $data = do { local $/; <$fh> };
+        $args = unpack 'Z*', $data;
         close $fh;
 
         #$args =~ s/\0/ /g;    # Replace null bytes with spaces
@@ -105,7 +106,7 @@ sub get_procs_freebsd {
     # die sprintf( 'sysctl size failed: %d %s', $!, $! ) if $ret == -1;
     return [] if $ret == -1;
 
-    my $bufsize = unpack( 'i', $size );
+    my $bufsize = unpack 'i', $size;
 
     # die 'Invalid size' unless $bufsize > 0;
     return [] unless $bufsize > 0;
@@ -178,7 +179,7 @@ sub get_proc_args {
     );
     return if $ret == -1;
 
-    my $bufsize = unpack( 'i', $size );
+    my $bufsize = unpack 'i', $size;
 
     # die 'Invalid size' unless $bufsize > 0;
     return unless $bufsize > 0;
@@ -196,7 +197,7 @@ sub get_proc_args {
     );
     return if $ret == -1;
 
-    return unpack( 'Z*', $data );
+    return unpack 'Z*', $data;
 }
 
 sub print_table {
