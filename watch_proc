@@ -10,7 +10,7 @@ if ( $^O eq 'freebsd' ) {
 
 # get command line args
 my $verbose = 0;
-my $delay   = 1;
+my $delay   = 2;
 GetOptions(
     'verbose|v' => \$verbose,
     'delay|d=i' => \$delay
