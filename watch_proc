@@ -70,7 +70,6 @@ sub get_procs_linux {
         #$args =~ s/\0/ /g;    # Replace null bytes with spaces
         $args ||= $comm;    # Use process name if no command line
         $args =~ s/^[(].*?[)] //;
-        substr($args, $Width) = q();
 
         push @procs,
             {
@@ -146,7 +145,6 @@ sub get_procs_freebsd {
         my $args = get_proc_args($pid);
         $args ||= $comm;    # Use process name if no command line
         $args =~ s/^[(].*?[)] //;
-        substr($args, $Width) = q();
 
         push @procs,
             {
@@ -221,6 +219,8 @@ sub print_table {
     for my $row ( @{$table} ) {
         push @{$row}, q() while $#{$row} < $#max;
         my $line = sprintf $format, @{$row};
+        substr($line, $Width, length($line) - $Width) = "\n"
+            if length($line) > $Width;
         $used += int( ( length $line ) / $Width + 1 );
         print $line if $used < $Height - 1;
     }
