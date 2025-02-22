@@ -205,7 +205,7 @@ sub print_table {
     for my $col ( 0 .. $#max ) {
         push @format, join q(), q(%-), ($col < $#max) ? $max[$col] : q(), 's';
     }
-    my $format = "\e[2K" . join( q( ), @format ) . "\n";
+    my $format = "\e[2K" . join( q(  ), @format ) . "\n";
     print "\e[H\e[2J";
     for my $row ( @{$table} ) {
         push @{$row}, q() while $#{$row} < $#max;
