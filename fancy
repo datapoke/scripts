@@ -50,9 +50,10 @@ sub draw {
             clear($line) or next;
             draw_line($line);
         }
-        if ($Count < $Height - 1) {
+        if ( $Count < $Height - 1 ) {
+
             # print empty space to fill the screen
-            print "\e[2K\n" x ( $Height - $Count - 1);
+            print "\e[2K\n" x ( $Height - $Count - 1 );
         }
     }
     else {
@@ -70,18 +71,17 @@ sub draw_line {
     chomp $line;
     if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
         my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
-        my $color = get_color(\$msg);
+        my $color = get_color( \$msg );
         printf "\e[2K\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
             $date, $host, $process, $msg;
     }
     elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
         my ( $date, $host, $msg ) = ( $1, $2, $3 );
-        my $color = get_color(\$msg);
-        printf "\e[2K\e[95m%s \e[96m%s $color%s\e[0m\n",
-            $date, $host, $msg;
+        my $color = get_color( \$msg );
+        printf "\e[2K\e[95m%s \e[96m%s $color%s\e[0m\n", $date, $host, $msg;
     }
     else {
-        my $color = get_color(\$line);
+        my $color = get_color( \$line );
         print "\e[2K", $color, $line, "\e[0m\n";
     }
 }
@@ -113,7 +113,7 @@ sub clear {
         $Count     = $span;
         $Timestamp = $now;
         print "\e[H";
-        print "\e[2J" if (not @ARGV);
+        print "\e[2J" if ( not @ARGV );
     }
     return $rv;
 }
@@ -122,10 +122,12 @@ sub get_color {
     my $line  = shift;
     my $color = undef;
     if ( $$line =~ m{ERROR:} ) {
+
         #$color = "\e[30;101m";
         $color = "\e[91m";
     }
     elsif ( $$line =~ m{WARNING:} ) {
+
         #$color = "\e[30;103m";
         $color = "\e[93m";
     }
@@ -134,7 +136,8 @@ sub get_color {
     }
     elsif ( $$line =~ m{auth|ssh|sftp}i ) {
         $color = "\e[92m";
-        $$line =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[91m$2$color}i;
+        $$line
+            =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[91m$2$color}i;
     }
     elsif ( $$line =~ m{fail|error}i ) {
         $color = "\e[91m";

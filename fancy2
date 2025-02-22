@@ -68,18 +68,17 @@ sub fancify {
     chomp $line;
     if ( $line =~ m{^($Date_Re) (\S+) (.*?:) (.*)$} ) {
         my ( $date, $host, $process, $msg ) = ( $1, $2, $3, $4 );
-        my $color = get_color(\$msg);
+        my $color = get_color( \$msg );
         printf "\e[95m%s \e[96m%s \e[94m%s $color%s\e[0m\n",
             $date, $host, $process, $msg;
     }
     elsif ( $line =~ m{^($Date_Re) (\S+) (.*)$} ) {
         my ( $date, $host, $msg ) = ( $1, $2, $3 );
-        my $color = get_color(\$msg);
-        printf "\e[95m%s \e[96m%s $color%s\e[0m\n",
-            $date, $host, $msg;
+        my $color = get_color( \$msg );
+        printf "\e[95m%s \e[96m%s $color%s\e[0m\n", $date, $host, $msg;
     }
     else {
-        my $color = get_color(\$line);
+        my $color = get_color( \$line );
         print $color, $line, "\e[0m\n";
     }
     return;
@@ -89,10 +88,12 @@ sub get_color {
     my $line  = shift;
     my $color = undef;
     if ( $$line =~ m{ERROR:} ) {
+
         #$color = "\e[30;101m";
         $color = "\e[91m";
     }
     elsif ( $$line =~ m{WARNING:} ) {
+
         #$color = "\e[30;103m";
         $color = "\e[93m";
     }
@@ -101,7 +102,8 @@ sub get_color {
     }
     elsif ( $$line =~ m{auth|ssh|sftp}i ) {
         $color = "\e[92m";
-        $$line =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[91m$2$color}i;
+        $$line
+            =~ s{\b((?:user|login by|publickey for)[ :=]+)([^\s\]]+)}{$1\e[91m$2$color}i;
     }
     elsif ( $$line =~ m{fail|error}i ) {
         $color = "\e[91m";
