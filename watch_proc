@@ -64,12 +64,11 @@ sub get_procs_linux {
 
         # Get command line
         open( $fh, '<', "/proc/$pid/cmdline" ) or next;
-        my $data = do { local $/; <$fh> };
-        $args = unpack 'Z*', $data;
+        my $args = do { local $/; <$fh> };
         close $fh;
 
-        #$args =~ s/\0/ /g;    # Replace null bytes with spaces
         $args ||= $comm;    # Use process name if no command line
+        $args =~ s/\0/ /g;  # Replace null bytes with spaces
         $args =~ s/^[(].*?[)] //;
 
         push @procs,
@@ -145,6 +144,7 @@ sub get_procs_freebsd {
         my $user = @pw ? $pw[0] : 'unknown';
         my $args = get_proc_args($pid);
         $args ||= $comm;    # Use process name if no command line
+        $args =~ s/\0/ /g;  # Replace null bytes with spaces
         $args =~ s/^[(].*?[)] //;
 
         push @procs,
