@@ -193,7 +193,7 @@ sub get_proc_args {
 
 sub print_table {
     my ($table, $total) = @_;
-    my $used            = 1;
+    my $used            = 0;
     my @max             = ();
     my @format          = ();
     for my $row ( 0 .. $#{ $table } ) {
