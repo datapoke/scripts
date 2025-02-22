@@ -169,10 +169,9 @@ sub get_proc_args {
     );
     return if $ret == -1;
 
-    # die sprintf('sysctl size failed: %d %s', $!, $!) if $ret == -1;
-
     my $bufsize = unpack( 'i', $size );
-    die 'Invalid size' unless $bufsize > 0;
+    # die 'Invalid size' unless $bufsize > 0;
+    return unless $bufsize > 0;
 
     # allocate buffer and get data
     my $data = "\0" x $bufsize;
@@ -185,9 +184,8 @@ sub get_proc_args {
         undef,
         0
     );
-    die sprintf( 'sysctl data failed: %d %s', $!, $! ) if $ret == -1;
+    return if $ret == -1;
 
-    # return if $ret == -1;
     my $args = unpack( 'Z*', $data );
     $args =~ s/^[(].*?[)] //;
     return $args;
