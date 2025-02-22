@@ -70,6 +70,7 @@ sub get_procs_linux {
         #$args =~ s/\0/ /g;    # Replace null bytes with spaces
         $args ||= $comm;    # Use process name if no command line
         $args =~ s/^[(].*?[)] //;
+        substr($args, $Width) = q();
 
         push @procs,
             {
@@ -144,6 +145,8 @@ sub get_procs_freebsd {
         my $user = @pw ? $pw[0] : 'unknown';
         my $args = get_proc_args($pid);
         $args ||= $comm;    # Use process name if no command line
+        $args =~ s/^[(].*?[)] //;
+        substr($args, $Width) = q();
 
         push @procs,
             {
@@ -195,9 +198,7 @@ sub get_proc_args {
     );
     return if $ret == -1;
 
-    my $args = unpack( 'Z*', $data );
-    $args =~ s/^[(].*?[)] //;
-    return $args;
+    return unpack( 'Z*', $data );
 }
 
 sub print_table {
@@ -253,10 +254,7 @@ while (1) {
     # filter and count processes
     my %count = ();
     for my $proc (@$procs) {
-        my $key =
-            $verbose
-            ? sprintf( "%-${max}s %s", $proc->{user}, $proc->{args} )
-            : $proc->{user};
+        my $key = $verbose ? $proc->{args} : $proc->{user};
         next if $proc->{args}     =~ /watch_proc/;
         next unless $proc->{args} =~ /$pattern/;
         $count{$key}++;
