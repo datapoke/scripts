@@ -9,12 +9,14 @@ if ( $^O eq 'freebsd' ) {
 }
 
 # get command line args
-my $verbose = 0;
-my $delay   = 2;
+my $verbose      = 0;
+my $very_verbose = 0;
+my $delay        = 2;
 GetOptions(
-    'verbose|v' => \$verbose,
-    'delay|d=i' => \$delay
-) or die "Usage: $0 [-v] [-d <seconds>] <pattern>\n";
+    'verbose|v'      => \$verbose,
+    'very_verbose|V' => \$very_verbose,
+    'delay|d=i'      => \$delay
+) or die "Usage: $0 [-vV] [-d <seconds>] <pattern>\n";
 my $pattern = shift @ARGV || '.';
 my $Winch   = undef;
 my $Width   = `tput cols`;
@@ -264,7 +266,9 @@ while (1) {
     # filter and count processes
     my %count = ();
     for my $proc (@$procs) {
-        my $key = $verbose ? $proc->{args} : $proc->{user};
+        my $key = $very_verbose
+            ? join q( ), $proc->{user}, $proc->{args}
+            : $verbose ? $proc->{args} : $proc->{user};
         next if $proc->{args}     =~ /watch_proc/;
         next unless $proc->{args} =~ /$pattern/;
         $key =~ s/\s+$//;
