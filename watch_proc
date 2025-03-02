@@ -16,7 +16,7 @@ GetOptions(
     'verbose|v' => \$verbose,
     'user|u'    => \$show_user,
     'delay|d=i' => \$delay
-) or die "Usage: $0 [-vV] [-d <seconds>] <pattern>\n";
+) or die "Usage: $0 [-vu] [-d <seconds>] <pattern>\n";
 my $pattern = shift @ARGV || '.';
 my $Winch   = undef;
 my $Width   = `tput cols`;
