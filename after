@@ -1,0 +1,53 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+my $pattern = shift(@ARGV) // q();
+my $matched = undef;
+my $match   = undef;
+my $rewrite = undef;
+my %c = ( Jan => '01',
+          Feb => '02',
+          Mar => '03',
+          Apr => '04',
+          May => '05',
+          Jun => '06',
+          Jul => '07',
+          Aug => '08',
+          Sep => '09',
+          Oct => '10',
+          Nov => '11',
+          Dec => '12' );
+if ( $pattern =~ m{^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})$} ) {
+    $match = qr{(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})};
+}
+elsif ( $pattern =~ m{^\w{3}(?: \d{1,2})?(?: \d{2}:\d{2}:\d{2}[\s\D]*)?(?: \d{4})?$}i) {
+    $match = qr{(\w{3} \d{1,2} \d{2}:\d{2}:\d{2}[\s\D]* \d{4})}i;
+    $rewrite = sub { 
+        my ($original) = @_;
+        my ($m, $d, $time, $y) = split q( ), $original;
+        return join q( ), join( q(-), $y, $c{$m}, $d ), $time;
+    };
+    $pattern = &$rewrite($pattern);
+}
+else {
+    $match = qr{(\d+)};
+    $rewrite = sub {
+        my ($original) = @_;
+        return sprintf('%064d', $original);
+    };
+    $pattern = &$rewrite($pattern);
+    print "$pattern\n";
+}
+
+while (<>) {
+    if ($matched) {
+        print;
+    }
+    elsif (/$match/) {
+        my $capture = $rewrite ? &$rewrite($1) : $1;
+        if ( ( $capture cmp $pattern ) >= 0 ) {
+            print;
+            $matched = 1;
+        }
+    }
+}

@@ -1,2 +1,2 @@
 #!/bin/sh
-cat $@ | grep ' 503 ' | cut -d ' ' -f 6,7 | sed 's/:.. / /' | sort | uniq -c
+cat $@ | cut -d ' ' -f 6,7 | sed 's/:.. / /' | sort | uniq -c

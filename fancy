@@ -51,7 +51,6 @@ sub draw {
             draw_line($line);
         }
         if ( $Count < $Height - 1 ) {
-
             # print empty space to fill the screen
             print "\e[2K\n" x ( $Height - $Count - 1 );
         }
@@ -122,12 +121,10 @@ sub get_color {
     my $line  = shift;
     my $color = undef;
     if ( $$line =~ m{ERROR:} ) {
-
         #$color = "\e[30;101m";
         $color = "\e[91m";
     }
     elsif ( $$line =~ m{WARNING:} ) {
-
         #$color = "\e[30;103m";
         $color = "\e[93m";
     }

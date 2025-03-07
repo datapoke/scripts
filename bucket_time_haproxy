@@ -1,0 +1,2 @@
+#!/bin/sh
+cat $@ | grep -v fdncms_maintenance_service_frontend | cut -d ' ' -f 7 | sed 's/^.//; s/:..\....]//' | sort | uniq -c
