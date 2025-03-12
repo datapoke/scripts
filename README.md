@@ -1,3 +1,3 @@
-A few random little scripts I've made and found useful over the years .
+A few random little scripts I've made and found useful over the years.
 
-    Except "fancy" . That one is new .
+    Except "fancy". That one is new.
