@@ -62,7 +62,7 @@ sub get_procs_linux {
 
         # Get username
         my @pw   = getpwuid($uid);
-        my $user = @pw ? $pw[0] : 'unknown';
+        my $user = @pw ? $pw[0] : $uid;
 
         # Get command line
         open( $fh, '<', "/proc/$pid/cmdline" ) or next;
@@ -71,7 +71,7 @@ sub get_procs_linux {
 
         $args ||= $comm;    # Use process name if no command line
         $args =~ s/\0/ /g;  # Replace null bytes with spaces
-        $args =~ s/^[(].*?[)] //;
+        $args =~ s/^([(].*?[)]) (.*)/$2 $1/;
 
         push @procs,
             {
