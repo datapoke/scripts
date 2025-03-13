@@ -148,7 +148,7 @@ sub get_procs_freebsd {
 
         $args ||= $comm;    # Use process name if no command line
         $args =~ s/\0/ /g;  # Replace null bytes with spaces
-        $args =~ s/^[(].*?[)] //;
+        $args =~ s/^([(].*?[)]) (.*)/$2 $1/;
 
         push @procs,
             {
