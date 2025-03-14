@@ -143,7 +143,7 @@ sub get_procs_freebsd {
 
         # get username
         my @pw   = getpwuid($uid);
-        my $user = @pw ? $pw[0] : 'unknown';
+        my $user = @pw ? $pw[0] : $uid;
         my $args = get_proc_args($pid);
 
         $args ||= $comm;    # Use process name if no command line
