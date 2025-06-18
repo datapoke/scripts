@@ -20,10 +20,20 @@ my %c = ( Jan => '01',
 if ( $pattern =~ m{^\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})$} ) {
     $match = qr{(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})};
 }
+elsif ( $pattern =~ m{^\d{1,2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2}$}i) {
+    $match = qr{(\d{1,2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})}i;
+    $rewrite = sub { 
+        my ($original)    = @_;
+        my ($date, $time) = ($original =~ m{(.*?):(.*)});
+        my ($d, $m, $y)   = split q(/), $date;
+        return join q( ), join( q(-), $y, $c{$m}, $d ), $time;
+    };
+    $pattern = &$rewrite($pattern);
+}
 elsif ( $pattern =~ m{^\w{3}(?: \d{1,2})?(?: \d{2}:\d{2}:\d{2}[\s\D]*)?(?: \d{4})?$}i) {
     $match = qr{(\w{3} \d{1,2} \d{2}:\d{2}:\d{2}[\s\D]* \d{4})}i;
     $rewrite = sub { 
-        my ($original) = @_;
+        my ($original)         = @_;
         my ($m, $d, $time, $y) = split q( ), $original;
         return join q( ), join( q(-), $y, $c{$m}, $d ), $time;
     };
