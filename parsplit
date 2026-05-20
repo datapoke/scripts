@@ -1,0 +1,1199 @@
+#!/usr/bin/env python3
+"""
+parsplit — xargs-style parallel runner with split, in-place output.
+
+Usage:
+    parsplit [-P PROCS] [-n NARGS] [-I REPL] [--] CMD [ARGS...]
+
+Reads items from stdin (whitespace-separated, like xargs default) and
+runs up to PROCS invocations of CMD in parallel. The terminal is split
+vertically into PROCS panes; each pane shows the live tail of one slot,
+with a `+ <command>` header. As a slot finishes, the next queued item
+takes over that pane.
+
+Options:
+    -P PROCS         Max parallelism (default: os.cpu_count() or 4)
+    -n NARGS         Items per invocation (default: 1). Ignored when -I is set.
+    -I REPL          Substitution mode: replace REPL in any of ARGS with the
+                     current item. Forces NARGS=1.
+    -S, --strip-ansi Strip ALL ANSI escapes from command output before
+                     display. By default, SGR (color/style) escapes are
+                     preserved and other escapes (cursor moves, screen
+                     clears, OSC) are filtered out so they can't move the
+                     cursor outside the pane.
+
+Examples:
+    ls *.tar.gz | parsplit -P8 gzip -dk
+    find . -name '*.py' | parsplit -P4 -I{} python -m py_compile {}
+    seq 1 20 | parsplit -P5 sleep
+
+Display:
+- Each pane is backed by a small VT100-ish screen emulator. ANSI cursor
+  moves (CUU/CUD/CUF/CUB, CUP, ED, EL, IL/DL, ICH/DCH/ECH, scroll up/down,
+  save/restore cursor, SGR) update the screen buffer instead of bleeding
+  out of the pane. Output that would move past the bottom row scrolls
+  the screen up by one row; everything else is clamped to the pane size.
+- SGR (color/style) is rendered with the cell's attributes intact. Pass
+  --strip-ansi to render the screen as plain text without colors.
+- Each child sees its pty size set to the pane size via TIOCSWINSZ, and
+  the `LINES` / `COLUMNS` env vars are exported to match — so commands
+  that read either source format to the pane width.
+- SIGWINCH relayouts the block, resizes each pane's emulator, and pushes
+  the new size to every child via TIOCSWINSZ (children re-read LINES /
+  COLUMNS only if they handle SIGWINCH themselves).
+- Final exit code is the max of all child exit codes.
+"""
+
+import argparse
+import codecs
+import fcntl
+import os
+import pty
+import re
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import unicodedata
+
+REDRAW_HZ = 20
+HIDE_CURSOR = "\x1b[?25l"
+SHOW_CURSOR = "\x1b[?25h"
+CLEAR_LINE = "\x1b[2K"
+CLEAR_BELOW = "\x1b[J"
+SGR_RESET = "\x1b[0m"
+HEADER_RUNNING = "\x1b[1;36m"  # bold cyan
+HEADER_OK = "\x1b[1;32m"  # bold green
+HEADER_FAIL = "\x1b[1;31m"  # bold red
+
+# Used by `--strip-ansi` post-render to remove SGR from the emulator's
+# already-rendered lines. The emulator itself parses all ANSI from the
+# child's output; this regex only sees the SGR sequences the renderer
+# emitted to color cells.
+ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b[@-Z\\-_]"
+)
+
+
+def cell_width(ch: str) -> int:
+    o = ord(ch)
+    if o < 0x20 or o == 0x7F:
+        return 0
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
+def truncate(s: str, width: int) -> str:
+    """Truncate to `width` display cells; ANSI sequences pass through as
+    opaque zero-width tokens so colors survive and sequences are never
+    chopped mid-byte. Callers should append SGR_RESET to the rendered
+    line to prevent style bleed into subsequent rows.
+    """
+    if width <= 0:
+        return ""
+    # Tokenize as (text, cells); ANSI tokens are zero-width opaque chunks.
+    tokens: list[tuple[str, int]] = []
+    pos = 0
+    for m in ANSI_RE.finditer(s):
+        if m.start() > pos:
+            for c in s[pos : m.start()]:
+                tokens.append((c, cell_width(c)))
+        tokens.append((m.group(), 0))
+        pos = m.end()
+    for c in s[pos:]:
+        tokens.append((c, cell_width(c)))
+
+    total = sum(w for _, w in tokens)
+    if total <= width:
+        return s
+    budget = width - 1  # reserve one cell for the ellipsis
+    acc = 0
+    out: list[str] = []
+    for t, w in tokens:
+        if acc + w > budget:
+            break
+        out.append(t)
+        acc += w
+    return "".join(out) + "…"
+
+
+def format_argv(argv: list[str]) -> str:
+    return " ".join(shlex.quote(a) for a in argv)
+
+
+class SGRState:
+    """Semantic SGR state — bold/dim/italic/underline/blink/reverse/hidden/
+    strike, plus fg/bg (None, basic-16, 256-color, or RGB).
+
+    Stored as a value: callers `clone()` before stashing per-cell, and the
+    pane keeps a single mutable instance as the current state. `to_sgr()`
+    re-emits a canonical, bounded SGR sequence from the current state —
+    crucial because we used to concatenate the child's raw bytes, which
+    could chop sequences mid-byte when truncated and leak `9mnpm`-style
+    garbage onto the screen.
+    """
+
+    __slots__ = (
+        "bold",
+        "dim",
+        "italic",
+        "underline",
+        "blink",
+        "reverse",
+        "hidden",
+        "strike",
+        "fg",
+        "bg",
+    )
+
+    def __init__(self) -> None:
+        self.bold = False
+        self.dim = False
+        self.italic = False
+        self.underline = False
+        self.blink = False
+        self.reverse = False
+        self.hidden = False
+        self.strike = False
+        # fg/bg shapes: None | ('basic', 0-15) | ('256', 0-255) | ('rgb', r, g, b)
+        self.fg: tuple | None = None
+        self.bg: tuple | None = None
+
+    def reset(self) -> None:
+        self.bold = self.dim = self.italic = self.underline = False
+        self.blink = self.reverse = self.hidden = self.strike = False
+        self.fg = None
+        self.bg = None
+
+    def clone(self) -> "SGRState":
+        new = SGRState.__new__(SGRState)
+        new.bold = self.bold
+        new.dim = self.dim
+        new.italic = self.italic
+        new.underline = self.underline
+        new.blink = self.blink
+        new.reverse = self.reverse
+        new.hidden = self.hidden
+        new.strike = self.strike
+        new.fg = self.fg
+        new.bg = self.bg
+        return new
+
+    def key(self) -> tuple:
+        return (
+            self.bold,
+            self.dim,
+            self.italic,
+            self.underline,
+            self.blink,
+            self.reverse,
+            self.hidden,
+            self.strike,
+            self.fg,
+            self.bg,
+        )
+
+    def is_default(self) -> bool:
+        return self.key() == (
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            None,
+        )
+
+    def apply(self, params: list[int]) -> None:
+        # Empty `\x1b[m` resets.
+        if not params:
+            self.reset()
+            return
+        i = 0
+        n = len(params)
+        while i < n:
+            p = params[i]
+            if p == 0:
+                self.reset()
+            elif p == 1:
+                self.bold = True
+            elif p == 2:
+                self.dim = True
+            elif p == 3:
+                self.italic = True
+            elif p == 4:
+                self.underline = True
+            elif p == 5 or p == 6:
+                self.blink = True
+            elif p == 7:
+                self.reverse = True
+            elif p == 8:
+                self.hidden = True
+            elif p == 9:
+                self.strike = True
+            elif p == 22:
+                self.bold = False
+                self.dim = False
+            elif p == 23:
+                self.italic = False
+            elif p == 24:
+                self.underline = False
+            elif p == 25:
+                self.blink = False
+            elif p == 27:
+                self.reverse = False
+            elif p == 28:
+                self.hidden = False
+            elif p == 29:
+                self.strike = False
+            elif 30 <= p <= 37:
+                self.fg = ("basic", p - 30)
+            elif p == 38:
+                # Extended fg: 38;5;N (256) or 38;2;R;G;B (RGB).
+                if i + 1 < n:
+                    sub = params[i + 1]
+                    if sub == 5 and i + 2 < n:
+                        self.fg = ("256", params[i + 2] & 0xFF)
+                        i += 2
+                    elif sub == 2 and i + 4 < n:
+                        self.fg = (
+                            "rgb",
+                            params[i + 2] & 0xFF,
+                            params[i + 3] & 0xFF,
+                            params[i + 4] & 0xFF,
+                        )
+                        i += 4
+                    else:
+                        # Malformed; skip the sub-selector.
+                        i += 1
+            elif p == 39:
+                self.fg = None
+            elif 40 <= p <= 47:
+                self.bg = ("basic", p - 40)
+            elif p == 48:
+                if i + 1 < n:
+                    sub = params[i + 1]
+                    if sub == 5 and i + 2 < n:
+                        self.bg = ("256", params[i + 2] & 0xFF)
+                        i += 2
+                    elif sub == 2 and i + 4 < n:
+                        self.bg = (
+                            "rgb",
+                            params[i + 2] & 0xFF,
+                            params[i + 3] & 0xFF,
+                            params[i + 4] & 0xFF,
+                        )
+                        i += 4
+                    else:
+                        i += 1
+            elif p == 49:
+                self.bg = None
+            elif 90 <= p <= 97:
+                self.fg = ("basic", p - 90 + 8)
+            elif 100 <= p <= 107:
+                self.bg = ("basic", p - 100 + 8)
+            # else: ignore unknown attributes (underline color, font, etc.)
+            i += 1
+
+    def to_sgr(self) -> str:
+        """Emit a canonical SGR sequence representing this state. Empty when
+        the state is default — callers should treat empty as 'no markup'.
+        """
+        if self.is_default():
+            return ""
+        parts: list[int] = []
+        if self.bold:
+            parts.append(1)
+        if self.dim:
+            parts.append(2)
+        if self.italic:
+            parts.append(3)
+        if self.underline:
+            parts.append(4)
+        if self.blink:
+            parts.append(5)
+        if self.reverse:
+            parts.append(7)
+        if self.hidden:
+            parts.append(8)
+        if self.strike:
+            parts.append(9)
+        if self.fg is not None:
+            kind = self.fg[0]
+            if kind == "basic":
+                n = self.fg[1]
+                parts.append(30 + n if n < 8 else 90 + (n - 8))
+            elif kind == "256":
+                parts.extend([38, 5, self.fg[1]])
+            elif kind == "rgb":
+                parts.extend([38, 2, self.fg[1], self.fg[2], self.fg[3]])
+        if self.bg is not None:
+            kind = self.bg[0]
+            if kind == "basic":
+                n = self.bg[1]
+                parts.append(40 + n if n < 8 else 100 + (n - 8))
+            elif kind == "256":
+                parts.extend([48, 5, self.bg[1]])
+            elif kind == "rgb":
+                parts.extend([48, 2, self.bg[1], self.bg[2], self.bg[3]])
+        return "\x1b[" + ";".join(str(p) for p in parts) + "m"
+
+
+class VirtualPane:
+    """Tiny VT100-ish screen emulator backing one pane.
+
+    Stores a `rows × cols` grid of `(char, sgr_state)` cells. Feed it the
+    raw bytes (as decoded text) produced by the child; cursor moves /
+    erases / SGR all update the grid. `render_lines()` returns the grid
+    as a list of `rows` strings ready for write to the parent terminal.
+
+    Subset of supported control sequences (others are silently dropped):
+      - C0:  \\n / \\v / \\f (linefeed, scrolls at bottom), \\r (CR),
+             \\b (BS), \\t (TAB)
+      - ESC D        IND  (Index, single-char line feed)
+      - ESC E        NEL  (Next Line, CR + LF)
+      - ESC M        RI   (Reverse Index, scroll down at top)
+      - ESC 7 / 8    DECSC / DECRC (save/restore cursor + SGR)
+      - CSI A/B/C/D  cursor up/down/right/left
+      - CSI E/F      cursor next/prev line (col 0)
+      - CSI G/`/d    cursor abs column / abs row (HPA/VPA)
+      - CSI H/f      cursor position (CUP/HVP)
+      - CSI J        erase display (0=below, 1=above, 2/3=all)
+      - CSI K        erase in line (0=right, 1=left, 2=whole)
+      - CSI L/M      insert/delete lines
+      - CSI @/P/X    insert/delete/erase chars
+      - CSI S/T      scroll up/down
+      - CSI m        SGR (color/style; tracked per cell)
+      - CSI s / u    save/restore cursor (SCO variant)
+      - OSC ... ST/BEL  consumed and discarded (titles, etc.)
+      - DCS / SOS / APC / PM  consumed until ST.
+    Scroll regions (DECSTBM), alternate-screen toggles, and mode set/reset
+    (CSI h/l) are intentionally ignored: the goal is to keep TUI/progress
+    output inside the pane, not to be a perfect xterm.
+    """
+
+    __slots__ = (
+        "rows",
+        "cols",
+        "grid",
+        "cursor_row",
+        "cursor_col",
+        "_sgr",
+        "_sgr_cached",
+        "saved_row",
+        "saved_col",
+        "_saved_sgr",
+        "_state",
+        "_buf",
+    )
+
+    def __init__(self, rows: int, cols: int):
+        self.rows = max(1, rows)
+        self.cols = max(1, cols)
+        # Per cell: (char, sgr_str). sgr_str is a canonical SGR sequence
+        # (or empty), produced by SGRState.to_sgr() at write time — never
+        # raw bytes from the child, so it can't be cut mid-sequence.
+        self.grid: list[list[tuple[str, str]]] = [
+            [(" ", "")] * self.cols for _ in range(self.rows)
+        ]
+        self.cursor_row = 0
+        self.cursor_col = 0
+        self._sgr = SGRState()
+        self._sgr_cached = ""
+        self.saved_row = 0
+        self.saved_col = 0
+        self._saved_sgr = SGRState()
+        self._state = "ground"
+        self._buf = ""
+
+    def _blank_row(self) -> list[tuple[str, str]]:
+        return [(" ", "")] * self.cols
+
+    def resize(self, rows: int, cols: int) -> None:
+        rows = max(1, rows)
+        cols = max(1, cols)
+        # Keep the bottom-right slice (most recent content + leftmost cols).
+        new_grid = [[(" ", "")] * cols for _ in range(rows)]
+        copy_rows = min(rows, self.rows)
+        copy_cols = min(cols, self.cols)
+        for i in range(copy_rows):
+            old_r = self.rows - copy_rows + i
+            new_r = rows - copy_rows + i
+            for c in range(copy_cols):
+                new_grid[new_r][c] = self.grid[old_r][c]
+        self.grid = new_grid
+        self.rows = rows
+        self.cols = cols
+        self.cursor_row = min(self.cursor_row, rows - 1)
+        self.cursor_col = min(self.cursor_col, cols - 1)
+        self.saved_row = min(self.saved_row, rows - 1)
+        self.saved_col = min(self.saved_col, cols - 1)
+
+    def feed(self, text: str) -> None:
+        for ch in text:
+            self._process(ch)
+
+    # ---- internal: state machine ----
+
+    def _process(self, ch: str) -> None:
+        s = self._state
+        if s == "ground":
+            if ch == "\x1b":
+                self._state = "esc"
+            elif ch == "\n" or ch == "\v" or ch == "\f":
+                # \v (VT) and \f (FF) act as line feeds on every terminal
+                # in common use. Dropping them was making child output
+                # that used \f (page-break style) or \v (some build tools)
+                # collapse multiple "lines" onto a single row.
+                self._linefeed()
+            elif ch == "\r":
+                self.cursor_col = 0
+            elif ch == "\b":
+                if self.cursor_col > 0:
+                    self.cursor_col -= 1
+            elif ch == "\t":
+                self.cursor_col = min(
+                    self.cols - 1, ((self.cursor_col // 8) + 1) * 8
+                )
+            elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+                # BEL and other C0 controls — drop silently.
+                pass
+            else:
+                self._put_char(ch)
+        elif s == "esc":
+            if ch == "[":
+                self._state = "csi"
+                self._buf = ""
+            elif ch == "]":
+                self._state = "osc"
+            elif ch in "PX_^":
+                self._state = "eat_st"
+            elif ch in "()*+":
+                # Charset designation — one more byte to ignore.
+                self._state = "charset"
+            elif ch == "7":  # DECSC
+                self.saved_row = self.cursor_row
+                self.saved_col = self.cursor_col
+                self._saved_sgr = self._sgr.clone()
+                self._state = "ground"
+            elif ch == "8":  # DECRC
+                self.cursor_row = min(self.saved_row, self.rows - 1)
+                self.cursor_col = min(self.saved_col, self.cols - 1)
+                self._sgr = self._saved_sgr.clone()
+                self._sgr_cached = self._sgr.to_sgr()
+                self._state = "ground"
+            elif ch == "D":  # IND - Index: cursor down, scroll if at bottom.
+                self._linefeed()
+                self._state = "ground"
+            elif ch == "E":  # NEL - Next Line: CR + LF.
+                self.cursor_col = 0
+                self._linefeed()
+                self._state = "ground"
+            elif ch == "M":  # RI - Reverse Index: cursor up, scroll down at top.
+                self._reverse_linefeed()
+                self._state = "ground"
+            else:
+                # Single-char ESC (ESC c reset terminal, ESC =, ESC #8, etc.) — ignore.
+                self._state = "ground"
+        elif s == "charset":
+            self._state = "ground"
+        elif s == "csi":
+            if "\x30" <= ch <= "\x3F" or "\x20" <= ch <= "\x2F":
+                self._buf += ch
+            elif "\x40" <= ch <= "\x7E":
+                self._handle_csi(self._buf, ch)
+                self._state = "ground"
+                self._buf = ""
+            else:
+                self._state = "ground"
+                self._buf = ""
+        elif s == "osc":
+            if ch == "\x07":
+                self._state = "ground"
+            elif ch == "\x1b":
+                self._state = "osc_esc"
+            # otherwise stay in osc, ignoring content
+        elif s == "osc_esc":
+            if ch == "\\":
+                self._state = "ground"
+            else:
+                self._state = "osc"
+        elif s == "eat_st":
+            if ch == "\x1b":
+                self._state = "eat_st_esc"
+        elif s == "eat_st_esc":
+            if ch == "\\":
+                self._state = "ground"
+            else:
+                self._state = "eat_st"
+
+    def _put_char(self, ch: str) -> None:
+        w = cell_width(ch)
+        if w == 0:
+            # Combining marks / zero-width joiners — attach to the previous
+            # cell so emoji + skin-tone selectors render together. If we're
+            # at column 0 with no previous cell, drop it.
+            if self.cursor_col > 0:
+                prev_col = self.cursor_col - 1
+                prev_ch, prev_sgr = self.grid[self.cursor_row][prev_col]
+                self.grid[self.cursor_row][prev_col] = (prev_ch + ch, prev_sgr)
+            return
+        # Wide chars (CJK, emoji, full-width) need TWO grid cells — one
+        # holding the actual char, the next a zero-width placeholder. If
+        # we didn't reserve that placeholder, the row would emit `cols`
+        # graphical cells but each wide char would take 2 display cells,
+        # making the row > cols wide and forcing the parent terminal to
+        # auto-wrap into the NEXT pane's area.
+        if self.cursor_col >= self.cols:
+            self.cursor_col = 0
+            self._linefeed()
+        if w == 2 and self.cursor_col + 1 >= self.cols:
+            # Wide char would straddle the right edge — wrap first.
+            self.cursor_col = 0
+            self._linefeed()
+        self.grid[self.cursor_row][self.cursor_col] = (ch, self._sgr_cached)
+        self.cursor_col += 1
+        if w == 2:
+            # Empty-string placeholder: emits zero bytes at render time, so
+            # the wide char occupies its rightful 2 display cells without
+            # crowding subsequent cells.
+            if self.cursor_col < self.cols:
+                self.grid[self.cursor_row][self.cursor_col] = (
+                    "",
+                    self._sgr_cached,
+                )
+            self.cursor_col += 1
+
+    def _linefeed(self) -> None:
+        if self.cursor_row >= self.rows - 1:
+            # Scroll up: discard top row, append blank bottom row.
+            self.grid.pop(0)
+            self.grid.append(self._blank_row())
+        else:
+            self.cursor_row += 1
+
+    def _reverse_linefeed(self) -> None:
+        # Reverse index: cursor up, insert a blank row at the TOP if we're
+        # already at the top (and drop the bottom row to keep size). Used
+        # by some pagers and TUIs when scrolling backwards through output.
+        if self.cursor_row <= 0:
+            self.grid.insert(0, self._blank_row())
+            self.grid.pop()
+        else:
+            self.cursor_row -= 1
+
+    def _handle_csi(self, params_str: str, final: str) -> None:
+        private = params_str.startswith("?")
+        if private:
+            params_str = params_str[1:]
+            # Strip any further intermediate / private markers.
+            params_str = params_str.lstrip("?<=>")
+        params: list[int] = []
+        if params_str:
+            for p in params_str.split(";"):
+                try:
+                    params.append(int(p) if p else 0)
+                except ValueError:
+                    params.append(0)
+
+        def p1(i: int, default: int = 1) -> int:
+            if i < len(params) and params[i] != 0:
+                return params[i]
+            return default
+
+        def p0(i: int, default: int = 0) -> int:
+            if i < len(params):
+                return params[i]
+            return default
+
+        # h/l (DECSET/DECRST) handled as no-op — including ?25 (cursor
+        # visibility), ?47/?1049 (alternate screen). The emulator has only
+        # one screen and the parent process controls cursor visibility.
+        if private and final in "hl":
+            return
+
+        if final == "A":
+            self.cursor_row = max(0, self.cursor_row - p1(0))
+        elif final == "B":
+            self.cursor_row = min(self.rows - 1, self.cursor_row + p1(0))
+        elif final == "C":
+            self.cursor_col = min(self.cols - 1, self.cursor_col + p1(0))
+        elif final == "D":
+            self.cursor_col = max(0, self.cursor_col - p1(0))
+        elif final == "E":
+            self.cursor_row = min(self.rows - 1, self.cursor_row + p1(0))
+            self.cursor_col = 0
+        elif final == "F":
+            self.cursor_row = max(0, self.cursor_row - p1(0))
+            self.cursor_col = 0
+        elif final in ("G", "`"):
+            self.cursor_col = max(0, min(self.cols - 1, p1(0) - 1))
+        elif final == "d":
+            self.cursor_row = max(0, min(self.rows - 1, p1(0) - 1))
+        elif final in ("H", "f"):
+            self.cursor_row = max(0, min(self.rows - 1, p1(0) - 1))
+            self.cursor_col = max(0, min(self.cols - 1, p1(1) - 1))
+        elif final == "J":
+            mode = p0(0)
+            if mode == 0:
+                self._erase_line_from(self.cursor_col)
+                for r in range(self.cursor_row + 1, self.rows):
+                    self.grid[r] = self._blank_row()
+            elif mode == 1:
+                for r in range(self.cursor_row):
+                    self.grid[r] = self._blank_row()
+                self._erase_line_to(self.cursor_col)
+            elif mode in (2, 3):
+                self.grid = [self._blank_row() for _ in range(self.rows)]
+        elif final == "K":
+            mode = p0(0)
+            if mode == 0:
+                self._erase_line_from(self.cursor_col)
+            elif mode == 1:
+                self._erase_line_to(self.cursor_col)
+            elif mode == 2:
+                self.grid[self.cursor_row] = self._blank_row()
+        elif final == "L":
+            n = min(p1(0), self.rows - self.cursor_row)
+            for _ in range(n):
+                self.grid.insert(self.cursor_row, self._blank_row())
+                self.grid.pop()
+        elif final == "M":
+            n = min(p1(0), self.rows - self.cursor_row)
+            for _ in range(n):
+                self.grid.pop(self.cursor_row)
+                self.grid.append(self._blank_row())
+        elif final == "@":
+            n = min(p1(0), self.cols - self.cursor_col)
+            row = self.grid[self.cursor_row]
+            for _ in range(n):
+                row.insert(self.cursor_col, (" ", ""))
+                row.pop()
+        elif final == "P":
+            n = min(p1(0), self.cols - self.cursor_col)
+            row = self.grid[self.cursor_row]
+            for _ in range(n):
+                row.pop(self.cursor_col)
+                row.append((" ", ""))
+        elif final == "X":
+            n = p1(0)
+            end = min(self.cols, self.cursor_col + n)
+            for c in range(self.cursor_col, end):
+                self.grid[self.cursor_row][c] = (" ", "")
+        elif final == "S":
+            for _ in range(p1(0)):
+                self.grid.pop(0)
+                self.grid.append(self._blank_row())
+        elif final == "T":
+            for _ in range(p1(0)):
+                self.grid.insert(0, self._blank_row())
+                self.grid.pop()
+        elif final == "s":  # SCO save cursor
+            self.saved_row = self.cursor_row
+            self.saved_col = self.cursor_col
+            self._saved_sgr = self._sgr.clone()
+        elif final == "u":  # SCO restore cursor
+            self.cursor_row = min(self.saved_row, self.rows - 1)
+            self.cursor_col = min(self.saved_col, self.cols - 1)
+            self._sgr = self._saved_sgr.clone()
+            self._sgr_cached = self._sgr.to_sgr()
+        elif final == "m":
+            self._sgr.apply(params)
+            self._sgr_cached = self._sgr.to_sgr()
+        # All other finals: silently ignored.
+
+    def _erase_line_from(self, col: int) -> None:
+        row = self.grid[self.cursor_row]
+        for c in range(col, self.cols):
+            row[c] = (" ", "")
+
+    def _erase_line_to(self, col: int) -> None:
+        row = self.grid[self.cursor_row]
+        for c in range(min(col + 1, self.cols)):
+            row[c] = (" ", "")
+
+    # ---- rendering ----
+
+    def render_lines(self) -> list[str]:
+        """Return `self.rows` strings — one per row, with SGR markup and a
+        trailing reset so nothing bleeds into the next row.
+        """
+        out: list[str] = []
+        for row in self.grid:
+            parts: list[str] = []
+            last_sgr = ""
+            for ch, sgr in row:
+                if sgr != last_sgr:
+                    if last_sgr:
+                        parts.append(SGR_RESET)
+                    if sgr:
+                        parts.append(sgr)
+                    last_sgr = sgr
+                parts.append(ch)
+            if last_sgr:
+                parts.append(SGR_RESET)
+            out.append("".join(parts))
+        return out
+
+
+class Slot:
+    __slots__ = (
+        "screen",
+        "cmd_label",
+        "done",
+        "rc",
+        "lock",
+        "master_fd",
+        "proc",
+        "thread",
+        "has_run",
+    )
+
+    def __init__(self, output_lines: int, cols: int):
+        self.screen = VirtualPane(output_lines, cols)
+        self.cmd_label = "(idle)"
+        self.done = True
+        self.rc: int | None = None
+        self.lock = threading.Lock()
+        self.master_fd: int = -1
+        self.proc: subprocess.Popen | None = None
+        self.thread: threading.Thread | None = None
+        self.has_run = False
+
+
+def set_winsize(fd: int, rows: int, cols: int) -> None:
+    try:
+        fcntl.ioctl(
+            fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0),
+        )
+    except OSError:
+        pass
+
+
+def reader(slot: Slot, master_fd: int, redraw_event: threading.Event):
+    """Stream the child pty's bytes into the slot's `VirtualPane`.
+
+    The pane is the terminal emulator — cursor moves, erases, SGR, and
+    CRLF translation all happen there. The reader is just a decode-and-feed
+    loop.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        text = decoder.decode(chunk)
+        if not text:
+            continue
+        with slot.lock:
+            slot.screen.feed(text)
+        redraw_event.set()
+    final = decoder.decode(b"", final=True)
+    if final:
+        with slot.lock:
+            slot.screen.feed(final)
+        redraw_event.set()
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+
+def parse_args(argv: list[str]):
+    p = argparse.ArgumentParser(
+        prog="parsplit",
+        description="xargs-style parallel runner with split, in-place output.",
+        add_help=True,
+    )
+    p.add_argument("-P", dest="procs", type=int, default=os.cpu_count() or 4)
+    p.add_argument("-n", dest="nargs", type=int, default=1)
+    p.add_argument("-I", dest="repl", default=None)
+    p.add_argument(
+        "-S",
+        "--strip-ansi",
+        dest="strip_ansi",
+        action="store_true",
+        help="Strip ALL ANSI escapes (including SGR colors) from output.",
+    )
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    args = p.parse_args(argv[1:])
+    if not args.rest:
+        p.error("command required (after options)")
+    # argparse.REMAINDER sometimes includes a literal '--' separator.
+    if args.rest and args.rest[0] == "--":
+        args.rest = args.rest[1:]
+    if not args.rest:
+        p.error("command required (after options)")
+    if args.procs < 1:
+        p.error("-P must be >= 1")
+    if args.nargs < 1:
+        p.error("-n must be >= 1")
+    if args.repl is not None:
+        args.nargs = 1
+    return args
+
+
+def build_invocations(
+    items: list[str], cmd: list[str], nargs: int, repl: str | None
+) -> list[list[str]]:
+    out: list[list[str]] = []
+    if repl is not None:
+        for item in items:
+            argv = [a.replace(repl, item) for a in cmd]
+            out.append(argv)
+    elif items:
+        for i in range(0, len(items), nargs):
+            out.append(list(cmd) + items[i : i + nargs])
+    else:
+        # No items, no substitution — run the command once as-is (xargs default).
+        out.append(list(cmd))
+    return out
+
+
+def main():
+    args = parse_args(sys.argv)
+
+    if sys.stdin.isatty():
+        items: list[str] = []
+    else:
+        items = sys.stdin.read().split()
+
+    invocations = build_invocations(items, args.rest, args.nargs, args.repl)
+    if not invocations:
+        sys.exit(0)
+
+    if not sys.stdout.isatty():
+        print("parsplit: stdout is not a tty", file=sys.stderr)
+        sys.exit(2)
+
+    procs = min(args.procs, len(invocations))
+    procs = max(1, procs)
+    strip_ansi = bool(args.strip_ansi)
+
+    def query_tty_size():
+        # Skip shutil.get_terminal_size — it honors $LINES/$COLUMNS env vars
+        # which shells set once at startup and never update on resize, so the
+        # values go stale the moment the user resizes the window. Go straight
+        # to TIOCGWINSZ on the real tty. Accept a fd's reported size only if
+        # both dimensions are non-zero — some pty wrappers (script(1)) init
+        # the pty with size (0, 0), and treating that as authoritative makes
+        # `truncate` return "" for every line.
+        for fd_candidate in (sys.stdout.fileno(), sys.stderr.fileno()):
+            try:
+                size = os.get_terminal_size(fd_candidate)
+                if size.lines > 0 and size.columns > 0:
+                    return size.lines, size.columns
+            except OSError:
+                continue
+        try:
+            with open("/dev/tty", "rb") as tty:
+                size = os.get_terminal_size(tty.fileno())
+                if size.lines > 0 and size.columns > 0:
+                    return size.lines, size.columns
+        except OSError:
+            pass
+        return 24, 80
+
+    def compute_layout():
+        rows, cols = query_tty_size()
+        avail = max(rows - 1, procs)
+        base = max(1, avail // procs)
+        # Distribute the integer-division remainder across the first
+        # `extra` panes so the block fills `avail` rows exactly. Without
+        # this, integer truncation leaves `avail % procs` rows of dead
+        # space above the parsplit block, where the previous terminal
+        # contents stay visible as a "garbage gap".
+        extra = max(0, avail - base * procs)
+        per_pane_rows = [base + 1 if i < extra else base for i in range(procs)]
+        per_pane_ol = [max(0, r - 1) for r in per_pane_rows]
+        tl = sum(per_pane_rows)
+        return rows, cols, per_pane_rows, per_pane_ol, tl
+
+    term_rows, term_cols, rows_per_pane, output_lines, total_lines = compute_layout()
+    # `rows_per_pane` and `output_lines` are now lists indexed by slot
+    # (the first `avail % procs` slots get one extra row).
+
+    slots = [Slot(output_lines[i], term_cols) for i in range(procs)]
+
+    queue = list(invocations)
+    queue_idx = 0
+    queue_lock = threading.Lock()
+
+    def next_task() -> list[str] | None:
+        nonlocal queue_idx
+        with queue_lock:
+            if queue_idx >= len(queue):
+                return None
+            argv = queue[queue_idx]
+            queue_idx += 1
+            return argv
+
+    all_rcs: list[int] = []
+    rc_lock = threading.Lock()
+
+    out = sys.stdout
+    out.write(HIDE_CURSOR)
+    # Reset to col 0 + reserve vertical space. Use \r\n explicitly so we
+    # don't depend on the tty's ONLCR mode — some wrappers and multiplexers
+    # leave it off and a bare \n then keeps the column unchanged, which
+    # breaks every subsequent cursor calculation.
+    out.write("\r")
+    out.write("\r\n" * total_lines)
+    out.write(f"\x1b[{total_lines}A")
+    out.flush()
+
+    redraw_event = threading.Event()
+    need_resize = threading.Event()
+    draw_lock = threading.Lock()
+    interrupted = False
+    # Previous frame's rendered rows (without CLEAR_LINE/cursor moves).
+    # Used to diff against the new frame so we only clear+rewrite rows
+    # that actually changed — flicker fix. Empty list = nothing rendered
+    # yet → next redraw is full. do_resize() clears it to force a full
+    # redraw after the geometry change.
+    prev_frame: list[str] = []
+
+    def redraw():
+        nonlocal prev_frame
+        with draw_lock:
+            # Build exactly `total_lines` content rows (no CLEAR_LINE
+            # prefix — that's added selectively in the diff step below).
+            content_rows: list[str] = []
+            for i, slot in enumerate(slots):
+                slot_ol = output_lines[i]
+                with slot.lock:
+                    screen_lines = (
+                        slot.screen.render_lines() if slot_ol > 0 else []
+                    )
+                    header_text = f"+ {slot.cmd_label}"
+                    if slot.done and slot.has_run:
+                        header_text = f"{header_text}  [exit {slot.rc}]"
+                        color = HEADER_OK if slot.rc == 0 else HEADER_FAIL
+                    else:
+                        color = HEADER_RUNNING
+                header_visible = truncate(header_text, term_cols)
+                content_rows.append(color + header_visible + SGR_RESET)
+                for j in range(slot_ol):
+                    line = screen_lines[j] if j < len(screen_lines) else ""
+                    if strip_ansi:
+                        line = ANSI_RE.sub("", line)
+                        line = truncate(line, term_cols) + SGR_RESET
+                    content_rows.append(line)
+
+            # Frame-skip when nothing changed at all — no cursor wiggle.
+            if content_rows == prev_frame:
+                return
+
+            # Per-row diff: clear+rewrite only the changed rows; unchanged
+            # rows get a bare \r\n that advances the cursor without
+            # repainting. That kills the per-frame flicker where every row
+            # was cleared then restored to the same content.
+            parts: list[str] = ["\r"]
+            for i, row in enumerate(content_rows):
+                is_last = i == total_lines - 1
+                if i < len(prev_frame) and prev_frame[i] == row:
+                    # Unchanged row — skip the clear+rewrite.
+                    if not is_last:
+                        parts.append("\r\n")
+                else:
+                    parts.append(CLEAR_LINE + row)
+                    if not is_last:
+                        parts.append("\r\n")
+            if total_lines > 1:
+                parts.append(f"\r\x1b[{total_lines - 1}A")
+            else:
+                parts.append("\r")
+            out.write("".join(parts))
+            out.flush()
+            prev_frame = content_rows
+
+    def do_resize():
+        nonlocal term_rows, term_cols, rows_per_pane, output_lines, total_lines
+        nonlocal prev_frame
+        new_rows, new_cols, new_rpp, new_ol, new_tl = compute_layout()
+        with draw_lock:
+            out.write("\r")
+            out.write(CLEAR_BELOW)
+            out.write("\r\n" * new_tl)
+            out.write(f"\x1b[{new_tl}A")
+            out.flush()
+            # Geometry changed — invalidate the diff cache so the next
+            # redraw repaints every row.
+            prev_frame = []
+        for i, slot in enumerate(slots):
+            slot_ol = new_ol[i]
+            with slot.lock:
+                slot.screen.resize(max(1, slot_ol), max(1, new_cols))
+            if slot.master_fd != -1:
+                set_winsize(slot.master_fd, max(1, slot_ol), max(1, new_cols))
+        term_rows, term_cols = new_rows, new_cols
+        rows_per_pane, output_lines, total_lines = new_rpp, new_ol, new_tl
+
+    def start_task(slot: Slot, argv: list[str]) -> None:
+        # Each slot's pane has its own height (the first few panes carry
+        # the layout remainder so the block fills the available rows).
+        slot_idx = slots.index(slot)
+        pane_rows = max(1, output_lines[slot_idx])
+        pane_cols = max(1, term_cols)
+        with slot.lock:
+            slot.screen = VirtualPane(pane_rows, pane_cols)
+            slot.cmd_label = format_argv(argv)
+            slot.done = False
+            slot.rc = None
+            slot.has_run = True
+        master_fd, slave_fd = pty.openpty()
+        set_winsize(slave_fd, pane_rows, pane_cols)
+        # Tell the child its terminal size via env too — many tools read
+        # LINES / COLUMNS instead of (or in addition to) TIOCGWINSZ.
+        env = os.environ.copy()
+        env["LINES"] = str(pane_rows)
+        env["COLUMNS"] = str(pane_cols)
+        env["TERM"] = env.get("TERM", "xterm-256color")
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+                env=env,
+            )
+        except OSError as e:
+            os.close(slave_fd)
+            os.close(master_fd)
+            with slot.lock:
+                slot.screen.feed(f"parsplit: failed to exec: {e}\r\n")
+                slot.done = True
+                slot.rc = 127
+            with rc_lock:
+                all_rcs.append(127)
+            redraw_event.set()
+            return
+        os.close(slave_fd)
+        slot.master_fd = master_fd
+        slot.proc = proc
+        slot.thread = threading.Thread(
+            target=reader,
+            args=(slot, master_fd, redraw_event),
+            daemon=True,
+        )
+        slot.thread.start()
+
+    # Initial dispatch
+    for slot in slots:
+        argv = next_task()
+        if argv is not None:
+            start_task(slot, argv)
+
+    def shutdown_signal_handler(_signum, _frame):
+        # First signal: SIGTERM all children + drain queue. Second signal
+        # (or any later): SIGKILL — the user is impatient or a child won't
+        # die gracefully. Wake the main loop so it notices and exits.
+        nonlocal interrupted
+        nonlocal queue_idx
+        escalate = interrupted  # already received one signal?
+        interrupted = True
+        with queue_lock:
+            queue_idx = len(queue)
+        sig = signal.SIGKILL if escalate else signal.SIGTERM
+        for slot in slots:
+            if slot.proc is not None and slot.proc.poll() is None:
+                try:
+                    os.killpg(slot.proc.pid, sig)
+                except Exception:
+                    try:
+                        slot.proc.send_signal(sig)
+                    except Exception:
+                        pass
+        # Make the main loop's redraw_event.wait() return immediately so
+        # the loop re-checks all_idle and exits as soon as the children
+        # are reaped.
+        redraw_event.set()
+
+    def sigwinch_handler(_signum, _frame):
+        need_resize.set()
+        redraw_event.set()
+
+    signal.signal(signal.SIGINT, shutdown_signal_handler)
+    signal.signal(signal.SIGTERM, shutdown_signal_handler)
+    try:
+        signal.signal(signal.SIGWINCH, sigwinch_handler)
+    except (AttributeError, ValueError):
+        pass
+
+    def all_idle() -> bool:
+        for slot in slots:
+            if slot.proc is not None and slot.proc.poll() is None:
+                return False
+        with queue_lock:
+            if queue_idx < len(queue):
+                return False
+        return True
+
+    try:
+        while not all_idle():
+            redraw_event.wait(timeout=1.0 / REDRAW_HZ)
+            redraw_event.clear()
+            if need_resize.is_set():
+                need_resize.clear()
+                do_resize()
+            # Detect finished tasks and record rc; defer dispatching the
+            # next task until AFTER a redraw, so the completed task's
+            # final screen state (with [exit N] header) is rendered at
+            # least once before start_task resets the pane for reuse.
+            newly_completed: list[Slot] = []
+            for slot in slots:
+                if slot.proc is None:
+                    continue
+                rc = slot.proc.poll()
+                if rc is not None and not slot.done:
+                    if slot.thread is not None:
+                        slot.thread.join(timeout=0.1)
+                    with slot.lock:
+                        slot.done = True
+                        slot.rc = rc
+                    with rc_lock:
+                        all_rcs.append(rc)
+                    newly_completed.append(slot)
+            if newly_completed:
+                redraw()
+            for slot in newly_completed:
+                nxt = next_task()
+                if nxt is not None:
+                    start_task(slot, nxt)
+            redraw()
+        # Final pass — join readers, refresh display.
+        for slot in slots:
+            if slot.thread is not None:
+                slot.thread.join(timeout=1.0)
+        redraw()
+    finally:
+        out.write(f"\x1b[{total_lines}B\r")
+        out.write(SHOW_CURSOR)
+        out.flush()
+
+    if interrupted and not all_rcs:
+        sys.exit(130)
+    sys.exit(max(all_rcs) if all_rcs else 0)
+
+
+if __name__ == "__main__":
+    main()
