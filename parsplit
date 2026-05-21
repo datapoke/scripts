@@ -132,8 +132,32 @@ def truncate(s: str, width: int) -> str:
     return "".join(out) + "…"
 
 
+_SHELL_SAFE_RE = re.compile(r"^[\w@%+=:,./-]+$")
+
+
+def shell_quote(s: str) -> str:
+    """Like shlex.quote, but uses double-quote wrapping when the input contains
+    single quotes (and double-quote escaping is safe). The stdlib version
+    always single-quotes-with-closing-and-reopening, which turns `ARGS="''"`
+    into `'ARGS="'"'"''"'"'"'` — correct but unreadable. This produces
+    `"ARGS=\\"''\\""` instead. Falls back to shlex.quote for inputs that
+    contain a single quote AND any of `$`, backtick, or backslash (where
+    double-quote wrapping would re-introduce shell expansion or escape
+    interpretation).
+    """
+    if not s:
+        return "''"
+    if _SHELL_SAFE_RE.match(s):
+        return s
+    if "'" not in s:
+        return "'" + s + "'"
+    if not any(c in s for c in '$`\\'):
+        return '"' + s.replace('"', r"\"") + '"'
+    return shlex.quote(s)
+
+
 def format_argv(argv: list[str]) -> str:
-    return " ".join(shlex.quote(a) for a in argv)
+    return " ".join(shell_quote(a) for a in argv)
 
 
 class SGRState:
@@ -883,33 +907,48 @@ def build_invocations_lines(
 ) -> list[list[str]]:
     """xargs -L semantics: emit one invocation per group of max_lines nonblank
     logical lines. A line whose trailing whitespace would be lost by rstrip()
-    is "continued" — its tokens accumulate with the next physical line into
-    one logical line. Blank lines outside continuations are skipped (and do
-    not count toward max_lines). Each logical line's whitespace-tokens become
-    args appended after `cmd`.
+    is "continued" — its content concatenates with the next physical line
+    into one logical line. Blank lines outside continuations are skipped
+    (and do not count toward max_lines). Each logical line is shell-tokenized
+    via shlex.split, so input quoting (`"foo bar"`, `'a b'`, `\\"`) survives —
+    matching xargs default behavior.
     """
     out: list[list[str]] = []
-    pending: list[str] = []
-    pending_count = 0
+    inv: list[str] = []
+    inv_count = 0
+    line_buf = ""
     continued = False
+
+    def tokenize(s: str) -> list[str]:
+        try:
+            return shlex.split(s)
+        except ValueError as e:
+            print(f"parsplit: {e}", file=sys.stderr)
+            sys.exit(2)
+
     for raw in text.splitlines():
         # A non-continuation blank line is skipped entirely (matches xargs:
         # only nonblank lines count toward max_lines).
         if not continued and not raw.strip():
             continue
         has_trailing_blank = raw != raw.rstrip()
-        pending.extend(raw.split())
+        line_buf += raw
         if has_trailing_blank:
             continued = True
             continue
+        inv.extend(tokenize(line_buf))
+        line_buf = ""
         continued = False
-        pending_count += 1
-        if pending_count >= max_lines:
-            out.append(list(cmd) + pending)
-            pending = []
-            pending_count = 0
-    if pending:
-        out.append(list(cmd) + pending)
+        inv_count += 1
+        if inv_count >= max_lines:
+            out.append(list(cmd) + inv)
+            inv = []
+            inv_count = 0
+    if line_buf:
+        # Trailing continuation with no terminator — treat as one final line.
+        inv.extend(tokenize(line_buf))
+    if inv:
+        out.append(list(cmd) + inv)
     if not out:
         # No items, no substitution — run the command once as-is (xargs default).
         out.append(list(cmd))
