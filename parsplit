@@ -3,7 +3,7 @@
 parsplit — xargs-style parallel runner with split, in-place output.
 
 Usage:
-    parsplit [-P PROCS] [-n NARGS] [-I REPL] [--] CMD [ARGS...]
+    parsplit [-P PROCS] [-n NARGS | -L MAX_LINES] [-I REPL] [--] CMD [ARGS...]
 
 Reads items from stdin (whitespace-separated, like xargs default) and
 runs up to PROCS invocations of CMD in parallel. The terminal is split
@@ -14,6 +14,11 @@ takes over that pane.
 Options:
     -P PROCS         Max parallelism (default: os.cpu_count() or 4)
     -n NARGS         Items per invocation (default: 1). Ignored when -I is set.
+    -L MAX_LINES     Use at most MAX_LINES nonblank input lines per command
+                     invocation (xargs -L semantics). Trailing whitespace on
+                     an input line continues it onto the next physical line
+                     as one logical line. Each logical line's tokens become
+                     args. Conflicts with -n and -I.
     -I REPL          Substitution mode: replace REPL in any of ARGS with the
                      current item. Forces NARGS=1.
     -S, --strip-ansi Strip ALL ANSI escapes from command output before
@@ -26,6 +31,7 @@ Examples:
     ls *.tar.gz | parsplit -P8 gzip -dk
     find . -name '*.py' | parsplit -P4 -I{} python -m py_compile {}
     seq 1 20 | parsplit -P5 sleep
+    ls -l | parsplit -L1 -P14 echo
 
 Display:
 - Each pane is backed by a small VT100-ish screen emulator. ANSI cursor
@@ -824,6 +830,7 @@ def parse_args(argv: list[str]):
     )
     p.add_argument("-P", dest="procs", type=int, default=os.cpu_count() or 4)
     p.add_argument("-n", dest="nargs", type=int, default=1)
+    p.add_argument("-L", dest="max_lines", type=int, default=None)
     p.add_argument("-I", dest="repl", default=None)
     p.add_argument(
         "-S",
@@ -845,6 +852,10 @@ def parse_args(argv: list[str]):
         p.error("-P must be >= 1")
     if args.nargs < 1:
         p.error("-n must be >= 1")
+    if args.max_lines is not None and args.max_lines < 1:
+        p.error("-L must be >= 1")
+    if args.max_lines is not None and args.repl is not None:
+        p.error("-L and -I are mutually exclusive")
     if args.repl is not None:
         args.nargs = 1
     return args
@@ -867,15 +878,53 @@ def build_invocations(
     return out
 
 
+def build_invocations_lines(
+    text: str, cmd: list[str], max_lines: int
+) -> list[list[str]]:
+    """xargs -L semantics: emit one invocation per group of max_lines nonblank
+    logical lines. A line whose trailing whitespace would be lost by rstrip()
+    is "continued" — its tokens accumulate with the next physical line into
+    one logical line. Blank lines outside continuations are skipped (and do
+    not count toward max_lines). Each logical line's whitespace-tokens become
+    args appended after `cmd`.
+    """
+    out: list[list[str]] = []
+    pending: list[str] = []
+    pending_count = 0
+    continued = False
+    for raw in text.splitlines():
+        # A non-continuation blank line is skipped entirely (matches xargs:
+        # only nonblank lines count toward max_lines).
+        if not continued and not raw.strip():
+            continue
+        has_trailing_blank = raw != raw.rstrip()
+        pending.extend(raw.split())
+        if has_trailing_blank:
+            continued = True
+            continue
+        continued = False
+        pending_count += 1
+        if pending_count >= max_lines:
+            out.append(list(cmd) + pending)
+            pending = []
+            pending_count = 0
+    if pending:
+        out.append(list(cmd) + pending)
+    if not out:
+        # No items, no substitution — run the command once as-is (xargs default).
+        out.append(list(cmd))
+    return out
+
+
 def main():
     args = parse_args(sys.argv)
 
-    if sys.stdin.isatty():
-        items: list[str] = []
+    stdin_text = "" if sys.stdin.isatty() else sys.stdin.read()
+    if args.max_lines is not None:
+        invocations = build_invocations_lines(stdin_text, args.rest, args.max_lines)
     else:
-        items = sys.stdin.read().split()
-
-    invocations = build_invocations(items, args.rest, args.nargs, args.repl)
+        items = stdin_text.split()
+        invocations = build_invocations(items, args.rest, args.nargs, args.repl)
     if not invocations:
         sys.exit(0)
 
