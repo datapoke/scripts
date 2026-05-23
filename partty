@@ -11,6 +11,13 @@ vertically into PROCS panes; each pane shows the live tail of one slot,
 with a `+ <command>` header. As a slot finishes, the next queued item
 takes over that pane.
 
+When stdout is NOT a tty (pipes, CI, non-interactive shells), partty
+falls back to a plain parallel runner — no pane UI: each invocation runs
+with its combined stdout+stderr captured, and when it finishes its output
+is printed as one labeled block (`+ <command>` … `[exit N]`). Blocks are
+grouped per job (not line-interleaved) so parallel output stays readable.
+Exit code is still the max of all children.
+
 Options:
     -P PROCS         Max parallelism (default: os.cpu_count() or 4)
     -n NARGS         Items per invocation (default: 1). Ignored when -I is set.
@@ -52,6 +59,7 @@ Display:
 
 import argparse
 import codecs
+import concurrent.futures
 import fcntl
 import os
 import pty
@@ -955,6 +963,47 @@ def build_invocations_lines(
     return out
 
 
+def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int:
+    """Non-tty fallback: run invocations in parallel (up to `procs`), printing
+    each one's combined output as a labeled block when it finishes. Output is
+    grouped per job (buffered to completion) — not line-interleaved — so
+    parallel logs stay attributable. Returns the max child exit code.
+    """
+    out_lock = threading.Lock()
+
+    def run_one(argv: list[str]) -> int:
+        label = format_argv(argv)
+        try:
+            proc = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            output = proc.stdout.decode("utf-8", "replace")
+            rc = proc.returncode
+        except OSError as e:
+            output = f"partty: failed to exec: {e}\n"
+            rc = 127
+        if strip_ansi:
+            output = ANSI_RE.sub("", output)
+        block = [f"+ {label}\n", output]
+        if output and not output.endswith("\n"):
+            block.append("\n")
+        block.append(f"  [exit {rc}]\n")
+        with out_lock:
+            sys.stdout.write("".join(block))
+            sys.stdout.flush()
+        return rc
+
+    rcs: list[int] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=procs) as ex:
+        # map preserves submission order for rc collection; printing happens
+        # in completion order inside run_one (guarded by out_lock).
+        rcs = list(ex.map(run_one, invocations))
+    return max(rcs) if rcs else 0
+
+
 def main():
     args = parse_args(sys.argv)
 
@@ -967,13 +1016,13 @@ def main():
     if not invocations:
         sys.exit(0)
 
-    if not sys.stdout.isatty():
-        print("partty: stdout is not a tty", file=sys.stderr)
-        sys.exit(2)
-
     procs = min(args.procs, len(invocations))
     procs = max(1, procs)
     strip_ansi = bool(args.strip_ansi)
+
+    if not sys.stdout.isatty():
+        # No tty → no pane UI. Run plain (grouped parallel output) and exit.
+        sys.exit(run_plain(invocations, procs, strip_ansi))
 
     def query_tty_size():
         # Skip shutil.get_terminal_size — it honors $LINES/$COLUMNS env vars
