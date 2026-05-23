@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-parsplit — xargs-style parallel runner with split, in-place output.
+partty — xargs-style parallel runner with split, in-place output.
 
 Usage:
-    parsplit [-P PROCS] [-n NARGS | -L MAX_LINES] [-I REPL] [--] CMD [ARGS...]
+    partty [-P PROCS] [-n NARGS | -L MAX_LINES] [-I REPL] [--] CMD [ARGS...]
 
 Reads items from stdin (whitespace-separated, like xargs default) and
 runs up to PROCS invocations of CMD in parallel. The terminal is split
@@ -28,10 +28,10 @@ Options:
                      cursor outside the pane.
 
 Examples:
-    ls *.tar.gz | parsplit -P8 gzip -dk
-    find . -name '*.py' | parsplit -P4 -I{} python -m py_compile {}
-    seq 1 20 | parsplit -P5 sleep
-    ls -l | parsplit -L1 -P14 echo
+    ls *.tar.gz | partty -P8 gzip -dk
+    find . -name '*.py' | partty -P4 -I{} python -m py_compile {}
+    seq 1 20 | partty -P5 sleep
+    ls -l | partty -L1 -P14 echo
 
 Display:
 - Each pane is backed by a small VT100-ish screen emulator. ANSI cursor
@@ -848,7 +848,7 @@ def reader(slot: Slot, master_fd: int, redraw_event: threading.Event):
 
 def parse_args(argv: list[str]):
     p = argparse.ArgumentParser(
-        prog="parsplit",
+        prog="partty",
         description="xargs-style parallel runner with split, in-place output.",
         add_help=True,
     )
@@ -923,7 +923,7 @@ def build_invocations_lines(
         try:
             return shlex.split(s)
         except ValueError as e:
-            print(f"parsplit: {e}", file=sys.stderr)
+            print(f"partty: {e}", file=sys.stderr)
             sys.exit(2)
 
     for raw in text.splitlines():
@@ -968,7 +968,7 @@ def main():
         sys.exit(0)
 
     if not sys.stdout.isatty():
-        print("parsplit: stdout is not a tty", file=sys.stderr)
+        print("partty: stdout is not a tty", file=sys.stderr)
         sys.exit(2)
 
     procs = min(args.procs, len(invocations))
@@ -1006,7 +1006,7 @@ def main():
         # Distribute the integer-division remainder across the first
         # `extra` panes so the block fills `avail` rows exactly. Without
         # this, integer truncation leaves `avail % procs` rows of dead
-        # space above the parsplit block, where the previous terminal
+        # space above the partty block, where the previous terminal
         # contents stay visible as a "garbage gap".
         extra = max(0, avail - base * procs)
         per_pane_rows = [base + 1 if i < extra else base for i in range(procs)]
@@ -1168,7 +1168,7 @@ def main():
             os.close(slave_fd)
             os.close(master_fd)
             with slot.lock:
-                slot.screen.feed(f"parsplit: failed to exec: {e}\r\n")
+                slot.screen.feed(f"partty: failed to exec: {e}\r\n")
                 slot.done = True
                 slot.rc = 127
             with rc_lock:
