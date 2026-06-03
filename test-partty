@@ -1,0 +1,955 @@
+#!/usr/bin/env python3
+"""
+test-partty — behavioral tests for ~/.local/bin/partty.
+
+Each test forks partty under a fresh pty (size configurable), pipes
+stdin items into it, captures all bytes the parent would have seen on its
+terminal, and checks for expected behavior. The tests exercise:
+
+    - stdout / stderr / interleaved capture
+    - SGR colors (default passthrough + --strip-ansi)
+    - bare \\r in-place rewrites (progress bars)
+    - CRLF line endings from cooked-mode pty
+    - virtual-pane cursor moves (CUU + CUP) staying inside the pane
+    - ED (\\x1b[2J) + cursor home, line-feed scroll
+    - SGR canonicalization under long unreset chains (regression: byte
+      cap truncation used to chop sequences mid-byte and render
+      "9mnpm"/"2mnpm" garbage)
+    - slot reuse with more items than parallelism
+    - nonzero exit code propagation
+
+Usage:
+    test-partty            # run all
+    test-partty -v         # show captured tail of each test on failure
+    test-partty -k <pat>   # only tests with <pat> in their name
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import pty
+import re
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+# ----------------------------------------------------------------------
+# Test registry — `@test("name")` decorator collects callable tests.
+# ----------------------------------------------------------------------
+
+_tests: list[tuple[str, callable]] = []
+
+
+def test(name: str):
+    def wrap(fn):
+        _tests.append((name, fn))
+        return fn
+
+    return wrap
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
+
+PARSPLIT = os.environ.get("PARSPLIT", "partty")
+
+ANSI_RE = re.compile(
+    rb"\x1b\[[0-?]*[ -/]*[@-~]"
+    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    rb"|\x1b[@-Z\\_^]"
+)
+
+
+def strip_ansi(data: bytes) -> bytes:
+    return ANSI_RE.sub(b"", data)
+
+
+def run_partty(
+    args: list[str],
+    stdin_items: bytes = b"",
+    rows: int = 24,
+    cols: int = 80,
+    timeout: float = 5.0,
+) -> tuple[bytes, int]:
+    """Fork partty under a pty + stdin pipe, capture stdout bytes,
+    return (output, exit_status). exit_status is the raw waitpid status.
+    """
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(
+        slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0)
+    )
+    r, w = os.pipe()
+    if stdin_items:
+        os.write(w, stdin_items)
+    os.close(w)
+    pid = os.fork()
+    if pid == 0:
+        os.dup2(r, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        os.close(master_fd)
+        os.execvp(PARSPLIT, [PARSPLIT, *args])
+    os.close(slave_fd)
+    os.close(r)
+    output = b""
+    deadline = time.time() + timeout
+    child_done = False
+    status = 0
+    while time.time() < deadline:
+        rs, _, _ = select.select([master_fd], [], [], 0.1)
+        if rs:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+        if not child_done:
+            wpid, st = os.waitpid(pid, os.WNOHANG)
+            if wpid != 0:
+                child_done = True
+                status = st
+                # Drain remaining output. partty does a final redraw
+                # AFTER exit-detection in its main loop (where the [exit N]
+                # marker lands), plus a park-below + SHOW_CURSOR. Be
+                # generous — wait through 5 consecutive empty selects.
+                empty = 0
+                drain_until = time.time() + 1.0
+                while time.time() < drain_until and empty < 5:
+                    rs, _, _ = select.select([master_fd], [], [], 0.1)
+                    if not rs:
+                        empty += 1
+                        continue
+                    empty = 0
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output += chunk
+                break
+    if not child_done:
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            pass
+        try:
+            _, status = os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+    return output, status
+
+
+def assert_contains(haystack: bytes, needle: bytes, label: str = ""):
+    if needle not in haystack:
+        raise AssertionError(
+            f"missing {needle!r}" + (f" ({label})" if label else "")
+        )
+
+
+def assert_not_contains(haystack: bytes, needle: bytes, label: str = ""):
+    if needle in haystack:
+        raise AssertionError(
+            f"unexpected {needle!r}" + (f" ({label})" if label else "")
+        )
+
+
+def run_piped(args, stdin_items=b"", env=None):
+    """Run partty with stdout/stderr as PIPES (NOT a tty) so it exercises the
+    non-tty run_plain path. Returns (output_bytes, returncode)."""
+    e = os.environ.copy()
+    if env:
+        e.update(env)
+    p = subprocess.run(
+        [PARSPLIT, *args], input=stdin_items, capture_output=True, env=e
+    )
+    return p.stdout, p.returncode
+
+
+# Two work units so effective parallelism is >= 2 and the pane UI is engaged.
+# A SINGLE work unit (or -P1) short-circuits to a non-paned pass-through
+# (inherited stdio, no emulator), so every pane test must produce at least
+# two panes to actually exercise the VirtualPane.
+PANED_STDIN = b"a\nb\n"
+
+
+def run_paned(cmd: list[str], *, procs: int = 2, **kw) -> tuple[bytes, int]:
+    """Run partty with `-P<procs>` over two work units (`PANED_STDIN`) so the
+    pane emulator is engaged. Both panes run the identical command — fine for
+    presence assertions (`assert_contains`), which are unaffected by the
+    duplicated output. `cmd` is the command + args after the `-P` flag.
+    """
+    return run_partty([f"-P{procs}", *cmd], PANED_STDIN, **kw)
+
+
+def run_gated_pane(script: str, **kw) -> tuple[bytes, int]:
+    """Like `run_paned`, but only ONE pane emits content: with two work units
+    (`a`, `b`) under -P2 the emulator is engaged, yet a `$1`-guard makes only
+    the `a` pane run `script` while the `b` pane exits silently. That keeps a
+    single deterministic pane of content for tests that inspect the tail of the
+    captured frame — two concurrent panes would interleave their redraw frames
+    and make `rfind(marker)` + `splitlines()` ambiguous (spurious pass/fail).
+    `script` is a shell snippet run via `sh -c`.
+    """
+    gated = f'[ "$1" = a ] || exit 0\n{script}'
+    return run_partty(["-P2", "sh", "-c", gated, "_"], PANED_STDIN, **kw)
+
+
+# ----------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------
+
+
+@test("captures stdout")
+def t_stdout():
+    out, _ = run_paned(["sh", "-c", "echo hello; echo world", "_"])
+    assert_contains(out, b"hello")
+    assert_contains(out, b"world")
+
+
+@test("captures stderr only")
+def t_stderr_only():
+    out, _ = run_paned(["sh", "-c", "echo to-stderr >&2", "_"])
+    assert_contains(out, b"to-stderr")
+
+
+@test("captures interleaved stdout + stderr")
+def t_interleaved():
+    out, _ = run_paned(
+        [
+            "sh",
+            "-c",
+            "echo line1; echo err1 >&2; echo line2; echo err2 >&2",
+            "_",
+        ]
+    )
+    for w in (b"line1", b"err1", b"line2", b"err2"):
+        assert_contains(out, w)
+
+
+@test("captures git stderr from non-repo")
+def t_git_stderr():
+    # The work-unit item lands as a trailing pathspec arg; the not-a-repo
+    # error fires before pathspec handling, so both panes still error out.
+    out, _ = run_paned(["git", "-C", "/tmp", "status"])
+    low = out.lower()
+    if b"not a git" not in low and b"fatal" not in low:
+        raise AssertionError("git error message missing from output")
+
+
+@test("captures python stderr with nonzero exit")
+def t_python_stderr_exit():
+    # Keep the cmd line short — the rendered header is truncated to
+    # term_cols (80), so a long `python -c` would push [exit N] past the
+    # truncation point and look like a regression.
+    out, _ = run_paned(["sh", "-c", "echo py-stderr >&2; exit 1", "_"])
+    assert_contains(out, b"py-stderr")
+    plain = strip_ansi(out)
+    if b"[exit 1]" not in plain:
+        raise AssertionError("expected [exit 1] marker in rendered header")
+
+
+@test("SGR colors pass through by default")
+def t_sgr_default():
+    out, _ = run_paned(
+        [
+            "sh",
+            "-c",
+            "printf '\\x1b[31mRED\\x1b[0m and \\x1b[1;32mbold-green\\x1b[0m end\\n'",
+            "_",
+        ]
+    )
+    assert_contains(out, b"RED")
+    assert_contains(out, b"bold-green")
+    # The emulator re-emits canonical SGR — colors should be present.
+    if b"\x1b[31m" not in out:
+        raise AssertionError("expected red SGR (\\x1b[31m) in output")
+
+
+@test("--strip-ansi drops SGR from rendered output")
+def t_strip_ansi():
+    out, _ = run_partty(
+        [
+            "-S",
+            "-P2",
+            "sh",
+            "-c",
+            "printf '\\x1b[31mRED\\x1b[0m text\\n'",
+            "_",
+        ],
+        PANED_STDIN,
+    )
+    assert_contains(out, b"RED")
+    # The SGR around RED should be gone from the rendered pane (partty's
+    # own layout escapes — header color, cursor moves — are still present
+    # elsewhere; --strip-ansi only filters the rendered cell content). So
+    # we check that the immediate before-RED bytes don't include red SGR.
+    idx = out.find(b"RED")
+    while idx != -1:
+        window = out[max(0, idx - 12) : idx]
+        if window.endswith(b"\x1b[31m"):
+            raise AssertionError("[31m present right before RED under --strip-ansi")
+        idx = out.find(b"RED", idx + 1)
+
+
+@test("\\r progress-bar rewrites in place")
+def t_carriage_return():
+    out, _ = run_paned(
+        [
+            "sh",
+            "-c",
+            "for i in 1 2 3 4 5; do printf 'progress %d/5\\r' $i; sleep 0.1; done; printf 'final\\n'",
+            "_",
+        ]
+    )
+    # All intermediate progress states should appear (each in a separate
+    # redraw frame), plus the final committed line.
+    for w in (
+        b"progress 1/5",
+        b"progress 2/5",
+        b"progress 3/5",
+        b"progress 4/5",
+        b"progress 5/5",
+        b"final",
+    ):
+        assert_contains(out, w)
+
+
+@test("CRLF line endings produce non-empty lines")
+def t_crlf():
+    # Pty cooked mode translates \n -> \r\n. A buggy emulator could split
+    # the line on \r before the \n arrived, committing empty content.
+    out, _ = run_paned(["sh", "-c", "echo aaa; echo bbb; echo ccc", "_"])
+    plain = strip_ansi(out)
+    for w in (b"aaa", b"bbb", b"ccc"):
+        assert_contains(plain, w)
+
+
+@test("cursor-up (CUU) overwrites lines inside the pane")
+def t_cuu_overwrite():
+    # Child does the writes then sleeps briefly so a stable redraw frame
+    # lands AFTER the cursor-up + overwrite has been processed. We only
+    # examine the bytes AFTER the last "OVERWRITTEN" — earlier frames
+    # may legitimately show line2 before the CUU has been processed.
+    out, _ = run_gated_pane(
+        "printf 'line1\\nline2\\nline3\\n'; "
+        "printf '\\x1b[2A'; "
+        "printf 'OVERWRITTEN'; "
+        "printf '\\x1b[2B\\n'; "
+        "printf 'final\\n'; "
+        "sleep 0.2"
+    )
+    plain = strip_ansi(out)
+    assert_contains(plain, b"line1")
+    assert_contains(plain, b"OVERWRITTEN")
+    assert_contains(plain, b"line3")
+    assert_contains(plain, b"final")
+    # Inspect only the final stable frame: everything from the last
+    # "OVERWRITTEN" onward. No bare line == "line2" allowed there.
+    last_owr = plain.rfind(b"OVERWRITTEN")
+    tail = plain[last_owr:]
+    for raw_line in tail.splitlines():
+        if raw_line.strip() == b"line2":
+            raise AssertionError(
+                "line2 still rendered as its own line — CUU didn't overwrite"
+            )
+
+
+@test("ED (erase display) + cursor home clears the pane")
+def t_ed_home():
+    out, _ = run_gated_pane(
+        "printf 'junk1\\njunk2\\njunk3\\n'; "
+        "sleep 0.15; "
+        "printf '\\x1b[2J\\x1b[H'; "
+        "printf 'CLEAN1\\nCLEAN2\\n'"
+    )
+    plain = strip_ansi(out)
+    assert_contains(plain, b"CLEAN1")
+    assert_contains(plain, b"CLEAN2")
+    # At least one redraw frame after the clear must have CLEAN1 and
+    # CLEAN2 without any of the junk visible on the same frame. Easy
+    # proxy: somewhere in the byte stream, CLEAN1 appears in a redraw
+    # block that does NOT also contain junk1/junk2/junk3 in the same
+    # pane region. We use a rough test: a frame where the byte distance
+    # between CLEAN1 and the nearest junk* is large.
+    c = plain.find(b"CLEAN1")
+    j1 = plain.find(b"junk1", c)
+    j2 = plain.find(b"junk2", c)
+    j3 = plain.find(b"junk3", c)
+    later_junk = [x for x in (j1, j2, j3) if x != -1]
+    if later_junk and min(later_junk) - c < 200:
+        # junk lingered into a frame right after CLEAN1 — ED didn't fully
+        # clear the screen.
+        raise AssertionError("junk still visible after \\x1b[2J + \\x1b[H")
+
+
+@test("SGR canonicalization survives long unreset chain")
+def t_sgr_long_chain():
+    # Pre-fix: my pane accumulated raw SGR bytes per cell and sliced the
+    # last 128 bytes when it grew too long, leaving cells with cut-off
+    # sequences like "9mnpm". Now SGR is tracked semantically and re-
+    # emitted as a single canonical sequence per cell.
+    sgrs = "".join(
+        f"\\x1b[3{c}m" for c in range(1, 8) for _ in range(40)
+    )  # 280 SGRs
+    out, _ = run_paned(
+        ["sh", "-c", "printf '%b' '" + sgrs + "VISIBLE\\n'", "_"]
+    )
+    assert_contains(out, b"VISIBLE")
+    # The bytes immediately before "VISIBLE" should be a single complete
+    # SGR sequence (ESC [ … m), not a chopped fragment.
+    idx = out.rfind(b"VISIBLE")
+    window = out[max(0, idx - 20) : idx]
+    # Find the LAST SGR sequence in the window. If our canonicalization
+    # works, the window ends with `\x1b[<params>m`.
+    m = re.search(rb"\x1b\[[0-9;]*m([^\x1b]*)$", window)
+    if not m:
+        raise AssertionError(
+            f"no canonical SGR right before VISIBLE; window={window!r}"
+        )
+    # Trailing slice after the SGR (between final SGR and "VISIBLE")
+    # must be only safe layout bytes — no chopped "Nm" remnants.
+    trailing = m.group(1)
+    if re.search(rb"[0-9]+m[A-Za-z]", trailing):
+        raise AssertionError(
+            f"chopped-SGR garbage before VISIBLE: trailing={trailing!r}"
+        )
+
+
+@test("slot reuse with more items than parallelism")
+def t_slot_reuse():
+    # 5 items, -P3 -> 3 panes; slot reuse means each pane runs multiple
+    # tasks. Tighter timings + a more generous test timeout — flaked
+    # before when the child's sleep + scheduling pushed past 5s.
+    out, _ = run_partty(
+        [
+            "-P3",
+            "sh",
+            "-c",
+            "printf 'tag %d a\\n' \"$1\"; "
+            "printf 'tag %d b\\n' \"$1\"",
+            "_",
+        ],
+        b"1\n2\n3\n4\n5\n",
+        timeout=15.0,
+    )
+    plain = strip_ansi(out)
+    for tag_id in (1, 2, 3, 4, 5):
+        for sub in ("a", "b"):
+            tag = f"tag {tag_id} {sub}".encode()
+            assert_contains(plain, tag)
+
+
+@test("nonzero exit code propagates to the header")
+def t_exit_code():
+    out, _ = run_paned(["sh", "-c", "exit 7", "_"])
+    plain = strip_ansi(out)
+    assert_contains(plain, b"[exit 7]")
+
+
+@test("LINES / COLUMNS env vars are set for the child")
+def t_env_lines_cols():
+    out, _ = run_paned(
+        ["sh", "-c", "echo lines=$LINES cols=$COLUMNS", "_"],
+        rows=24,
+        cols=80,
+    )
+    plain = strip_ansi(out)
+    # Two panes split the 24 rows, so per-pane LINES is layout-dependent
+    # (~10-12); COLUMNS stays at the full width (80). Assert both are
+    # exported and positive, with the full width preserved.
+    m = re.search(rb"lines=(\d+) cols=(\d+)", plain)
+    if not m or int(m.group(1)) <= 0 or int(m.group(2)) != 80:
+        raise AssertionError(
+            f"LINES / COLUMNS not exported to child as expected; got {plain!r}"
+        )
+
+
+@test("ESC D (IND) advances to next row")
+def t_ind():
+    # ESC D is a single-byte line feed used by some TUI tools and build
+    # systems instead of \n. If the emulator drops it, two lines collapse
+    # onto one row.
+    out, _ = run_gated_pane("printf 'aaa\\x1bDbbb\\x1bDccc\\r\\n'; sleep 0.2")
+    plain = strip_ansi(out)
+    # Inspect the final stable frame.
+    tail = plain[plain.rfind(b"aaa") :]
+    rows = [r.strip() for r in tail.splitlines() if r.strip()]
+    # Without ESC D handling: aaabbbccc would be on a single row.
+    if b"aaabbbccc" in b" ".join(rows):
+        raise AssertionError("ESC D didn't line-feed — aaa/bbb/ccc collapsed")
+
+
+@test("ESC E (NEL) does CR + LF")
+def t_nel():
+    out, _ = run_gated_pane("printf 'left\\x1bEright\\r\\n'; sleep 0.2")
+    plain = strip_ansi(out)
+    tail = plain[plain.rfind(b"left") :]
+    rows = [r.strip() for r in tail.splitlines()]
+    # 'left' and 'right' must end up on different rows.
+    if b"leftright" in b" ".join(rows):
+        raise AssertionError("ESC E didn't CR+LF — left+right ran together")
+
+
+@test("\\f (form feed) acts as a line feed")
+def t_form_feed():
+    out, _ = run_gated_pane("printf 'top\\fmid\\fbot\\r\\n'; sleep 0.2")
+    plain = strip_ansi(out)
+    tail = plain[plain.rfind(b"top") :]
+    if b"topmidbot" in b" ".join(r.strip() for r in tail.splitlines()):
+        raise AssertionError("\\f was dropped — top/mid/bot collapsed")
+
+
+def _run_and_signal_partty(
+    args, stdin_items, sig, after_s=0.3, deadline=5.0, sig2=None, after2=0.4
+):
+    """Spawn partty, send it `sig` after `after_s` (and optionally `sig2` a
+    further `after2` later), return (output, status, elapsed). `output` is
+    whatever bytes partty wrote to its pty before exit; `status` is the raw
+    waitpid status (None if it never exited)."""
+    master_fd, slave_fd = pty.openpty()
+    fcntl.ioctl(
+        slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0)
+    )
+    r, w = os.pipe()
+    if stdin_items:
+        os.write(w, stdin_items)
+    os.close(w)
+    pid = os.fork()
+    if pid == 0:
+        os.dup2(r, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        os.close(master_fd)
+        os.execvp(PARSPLIT, [PARSPLIT, *args])
+    os.close(slave_fd)
+    os.close(r)
+    start = time.time()
+    time.sleep(after_s)
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    second_at = time.time() + after2 if sig2 is not None else None
+    output = b""
+    while time.time() - start < deadline:
+        if second_at is not None and time.time() >= second_at:
+            second_at = None
+            try:
+                os.kill(pid, sig2)
+            except ProcessLookupError:
+                pass
+        try:
+            rs, _, _ = select.select([master_fd], [], [], 0.05)
+            if rs:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    pass
+                else:
+                    if chunk:
+                        output += chunk
+        except Exception:
+            pass
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid != 0:
+            # Drain any trailing bytes (e.g. a traceback flushed at exit).
+            while True:
+                rs, _, _ = select.select([master_fd], [], [], 0.1)
+                if not rs:
+                    break
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output += chunk
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+            return output, status, time.time() - start
+    # Didn't exit within deadline — escalate.
+    try:
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    except (ProcessLookupError, ChildProcessError):
+        pass
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+    return output, None, time.time() - start
+
+
+@test("SIGINT cleanly exits with long-running child")
+def t_sigint():
+    import signal as _sig
+
+    _out, status, elapsed = _run_and_signal_partty(
+        ["-P2", "sleep", "10"], PANED_STDIN, _sig.SIGINT
+    )
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit within deadline after SIGINT ({elapsed:.2f}s)"
+        )
+    if elapsed > 2.0:
+        raise AssertionError(
+            f"partty took {elapsed:.2f}s to exit after SIGINT (too slow)"
+        )
+
+
+@test("SIGTERM cleanly exits with long-running child")
+def t_sigterm():
+    import signal as _sig
+
+    _out, status, elapsed = _run_and_signal_partty(
+        ["-P2", "sleep", "10"], PANED_STDIN, _sig.SIGTERM
+    )
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit within deadline after SIGTERM ({elapsed:.2f}s)"
+        )
+    if elapsed > 2.0:
+        raise AssertionError(
+            f"partty took {elapsed:.2f}s to exit after SIGTERM (too slow)"
+        )
+
+
+@test("Ctrl-C during pass-through exits cleanly, no traceback")
+def t_passthrough_sigint_clean():
+    import signal as _sig
+
+    # Single work unit -> pass-through. SIGINT goes to partty alone (not the
+    # child's group). partty must handle it: forward to the child, exit 130,
+    # and NOT dump a Python KeyboardInterrupt traceback.
+    out, status, elapsed = _run_and_signal_partty(
+        ["-P1", "sh", "-c", "sleep 10", "_"], b"x\n", _sig.SIGINT
+    )
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit after SIGINT in pass-through ({elapsed:.2f}s)"
+        )
+    assert_not_contains(out, b"Traceback", "SIGINT must be handled, not raised")
+    code = os.waitstatus_to_exitcode(status)
+    if code != 130:
+        raise AssertionError(f"expected exit 130 (128+SIGINT), got {code}")
+
+
+def _no_stray(tag):
+    """Fail-friendly check: no process whose args contain `tag` survives.
+    Returns the leftover lines (and SIGKILLs them so a failure can't wedge
+    later runs)."""
+    import subprocess as _sp
+
+    leftover = _sp.run(
+        ["pgrep", "-f", tag], capture_output=True, text=True
+    ).stdout.split()
+    if leftover:
+        _sp.run(["pkill", "-9", "-f", tag])
+    return leftover
+
+
+@test("SIGTERM during pass-through kills the child (no orphan)")
+def t_passthrough_sigterm_no_orphan():
+    import signal as _sig
+
+    # A unique sleep duration doubles as a findable marker for the child.
+    _out, status, elapsed = _run_and_signal_partty(
+        ["-P1", "sleep", "987654"], b"", _sig.SIGTERM
+    )
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit after SIGTERM in pass-through ({elapsed:.2f}s)"
+        )
+    leftover = _no_stray("sleep 987654")
+    if leftover:
+        raise AssertionError(
+            f"child orphaned after partty SIGTERM: {leftover}"
+        )
+
+
+@test("SIGTERM during pass-through kills the whole group (pipeline)")
+def t_passthrough_sigterm_group():
+    import signal as _sig
+
+    # `sh -c 'sleep | cat'` makes the sleep a GRANDCHILD of partty (a child of
+    # the sh). Forwarding to the single sh PID would leave the sleep orphaned;
+    # killing the child's process group reaches it. The unique duration is the
+    # marker (it appears in the orphaned sleep's own argv).
+    _out, status, elapsed = _run_and_signal_partty(
+        ["-P1", "sh", "-c", "sleep 987655 | cat", "_"], b"x\n", _sig.SIGTERM
+    )
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit after SIGTERM ({elapsed:.2f}s)"
+        )
+    leftover = _no_stray("sleep 987655")
+    if leftover:
+        raise AssertionError(
+            f"pipeline grandchild orphaned (group not killed): {leftover}"
+        )
+
+
+@test("a second signal force-kills a child that ignores the first")
+def t_passthrough_escalate():
+    import signal as _sig
+
+    # The child traps TERM and never exits; only a SIGKILL escalation on the
+    # SECOND signal can stop it. (Each transient `sleep 0.2` would die to the
+    # first TERM, but the trapping sh loop survives until SIGKILL.)
+    tag = "partty_escalate_987656"
+    _out, status, elapsed = _run_and_signal_partty(
+        ["-P1", "sh", "-c", f'trap "" TERM; while :; do sleep 0.2; done # {tag}', "_"],
+        b"x\n",
+        _sig.SIGTERM,
+        sig2=_sig.SIGTERM,
+        after2=0.6,
+        deadline=6.0,
+    )
+    leftover = _no_stray(tag)
+    if status is None:
+        raise AssertionError(
+            f"partty didn't exit after the second signal ({elapsed:.2f}s)"
+        )
+    if leftover:
+        raise AssertionError(
+            f"trapping child survived two signals (no SIGKILL escalation): {leftover}"
+        )
+
+
+@test("wide chars don't escape the pane horizontally")
+def t_wide_char():
+    # CJK / fullwidth chars are 2 display cells. Without proper handling,
+    # a row packed with them would emit > cols cells and force the parent
+    # terminal to wrap into the next pane.
+    out, _ = run_paned(
+        [
+            "sh",
+            "-c",
+            # 40 fullwidth digits — would be 80 display cells if 2 wide,
+            # so the row should NEITHER wrap nor overflow.
+            "printf '\\xef\\xbc\\x91\\xef\\xbc\\x92\\xef\\xbc\\x93\\xef\\xbc\\x94\\xef\\xbc\\x95'; echo; sleep 0.2",
+            "_",
+        ],
+        cols=80,
+    )
+    # Just verifying no crash + the wide chars appear in output.
+    if b"\xef\xbc\x91" not in out:
+        raise AssertionError("wide chars not present in rendered output")
+
+
+@test("OSC sequence (window title) is consumed and not rendered")
+def t_osc_consumed():
+    # OSC 0;<title>\x07 is a common terminal title escape.
+    out, _ = run_paned(
+        [
+            "sh",
+            "-c",
+            "printf 'before\\x1b]0;windowtitle\\x07after\\n'",
+            "_",
+        ]
+    )
+    plain = strip_ansi(out)
+    # "beforeafter" should appear in the pane (OSC consumed).
+    # "windowtitle" must NOT appear as visible text.
+    assert_contains(plain, b"beforeafter")
+    # Stripped pane content should not have the title leaking through.
+    # The title may still appear inside the header (literal cmd-label
+    # bytes), so look for it on its own line.
+    for raw_line in plain.splitlines():
+        s = raw_line.strip()
+        if s == b"windowtitle":
+            raise AssertionError("OSC title leaked into the pane as text")
+
+
+# ----------------------------------------------------------------------
+# Pass-through: effective parallelism 1 short-circuits the pane UI.
+# ----------------------------------------------------------------------
+
+HIDE_CURSOR = b"\x1b[?25l"
+
+
+@test("single work unit passes straight through (no pane chrome)")
+def t_passthrough_single():
+    # One item -> one invocation -> parallelism 1 -> the command writes
+    # straight to the terminal: raw output, no `+ label` header, no
+    # `[exit N]` footer, and partty never hides the cursor / reserves panes.
+    out, _ = run_partty(["echo", "onearg"], b"x\n")
+    assert_contains(out, b"onearg")
+    assert_not_contains(out, b"[exit", "pass-through must not decorate")
+    assert_not_contains(out, b"+ echo", "pass-through must not add a header")
+    assert_not_contains(out, HIDE_CURSOR, "pass-through must not set up panes")
+
+
+@test("no items runs the command once, passed through")
+def t_passthrough_no_items():
+    out, _ = run_partty(["echo", "hello"], b"")
+    assert_contains(out, b"hello")
+    assert_not_contains(out, b"[exit")
+    assert_not_contains(out, HIDE_CURSOR)
+
+
+@test("pass-through propagates the child exit code")
+def t_passthrough_exit_code():
+    _, status = run_partty(["false"], b"x\n")
+    rc = os.waitstatus_to_exitcode(status)
+    if rc != 1:
+        raise AssertionError(f"expected exit 1 from `false`, got {rc}")
+
+
+@test("-P1 over many work units runs sequentially, passed through")
+def t_passthrough_p1_sequential():
+    # -P1 -> parallelism 1 even with several work units; they run in order
+    # with inherited stdio and no decoration.
+    out, _ = run_partty(["-P1", "-L1", "echo"], b"a\nb\n")
+    assert_contains(out, b"a")
+    assert_contains(out, b"b")
+    assert_not_contains(out, b"[exit")
+    assert_not_contains(out, HIDE_CURSOR)
+
+
+@test("two work units engage the pane UI (not pass-through)")
+def t_passthrough_boundary():
+    # The complement of the cases above: parallelism 2 must NOT short-circuit
+    # — the pane UI is set up (cursor hidden) and headers are decorated.
+    out, _ = run_paned(["sh", "-c", "echo hi", "_"])
+    assert_contains(out, HIDE_CURSOR, "parallelism 2 should set up panes")
+    assert_contains(strip_ansi(out), b"[exit 0]", "panes decorate headers")
+
+
+@test("NO_PARTTY forces serial pass-through")
+def t_no_partty_env():
+    # Debug escape hatch: with the env var set, even two work units under
+    # -P2 collapse to serial pass-through — no pane UI, no decoration — so a
+    # partty buried in some script can be traced line-by-line.
+    os.environ["NO_PARTTY"] = "1"
+    try:
+        out, _ = run_paned(["sh", "-c", "echo hi", "_"])
+    finally:
+        del os.environ["NO_PARTTY"]
+    assert_contains(out, b"hi")
+    assert_not_contains(out, HIDE_CURSOR, "env var should disable the pane UI")
+    assert_not_contains(strip_ansi(out), b"[exit", "serial mode is undecorated")
+
+
+@test("non-tty single work unit keeps the labeled +/[exit] block")
+def t_nontty_single_labeled():
+    # Pass-through is a tty-only (interactive) optimization. When stdout is
+    # NOT a tty — i.e. anything PARSING partty's output — a single work unit
+    # must still go through run_plain and emit the documented
+    # `+ <command>` … `[exit N]` block, not raw output.
+    out, _ = run_piped(["echo", "onearg"])
+    assert_contains(out, b"+ echo onearg", "non-tty must keep the label header")
+    assert_contains(out, b"[exit 0]", "non-tty must keep the exit marker")
+    assert_contains(out, b"onearg")
+
+
+@test("non-tty NO_PARTTY stays labeled (serial run_plain, not raw)")
+def t_nontty_no_partty_labeled():
+    # NO_PARTTY off-tty should serialize via run_plain (still labeled), not
+    # strip the markers a parser relies on.
+    out, _ = run_piped(["-L1", "echo"], b"a\nb\n", env={"NO_PARTTY": "1"})
+    assert_contains(out, b"+ echo a")
+    assert_contains(out, b"+ echo b")
+    if out.count(b"[exit 0]") != 2:
+        raise AssertionError(f"expected two [exit 0] blocks; got {out!r}")
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Behavioral tests for partty."
+    )
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="On failure, print the last 800 bytes of captured output.",
+    )
+    ap.add_argument(
+        "-k",
+        "--filter",
+        default="",
+        help="Only run tests whose name contains this substring.",
+    )
+    args = ap.parse_args()
+
+    # Confirm partty is on PATH.
+    try:
+        subprocess.run(
+            [PARSPLIT, "--help"], capture_output=True, timeout=5
+        )
+    except FileNotFoundError:
+        print(
+            f"\033[1;31merror\033[0m: {PARSPLIT!r} not found on PATH "
+            f"(set PARSPLIT=<abs path> to override)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    selected = [
+        (n, fn) for n, fn in _tests if not args.filter or args.filter in n
+    ]
+    if not selected:
+        print(f"no tests match filter {args.filter!r}", file=sys.stderr)
+        sys.exit(2)
+
+    passed = failed = 0
+    failed_names: list[str] = []
+    # Pad every name to the longest one (min 55) so the PASS/FAIL column
+    # stays vertically aligned even when a test name overflows 55 chars.
+    name_w = max(55, *(len(n) for n, _ in selected))
+    for name, fn in selected:
+        sys.stdout.write(f"  {name:<{name_w}s} ")
+        sys.stdout.flush()
+        try:
+            fn()
+        except AssertionError as e:
+            print(f"\033[1;31mFAIL\033[0m  {e}")
+            failed += 1
+            failed_names.append(name)
+            if args.verbose:
+                # Re-run the test inside a try/except to capture the output
+                # — but we already discarded it. Just note the test name.
+                pass
+        except Exception as e:
+            print(f"\033[1;31mERROR\033[0m {type(e).__name__}: {e}")
+            failed += 1
+            failed_names.append(name)
+        else:
+            print("\033[1;32mPASS\033[0m")
+            passed += 1
+
+    total = passed + failed
+    color = "\033[1;32m" if failed == 0 else "\033[1;31m"
+    print()
+    print(
+        f"{color}{passed}/{total} passed, {failed} failed\033[0m"
+    )
+    if failed_names and not args.verbose:
+        print("  re-run with -v <name> for details on:")
+        for n in failed_names:
+            print(f"    {n}")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

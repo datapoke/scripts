@@ -11,12 +11,31 @@ vertically into PROCS panes; each pane shows the live tail of one slot,
 with a `+ <command>` header. As a slot finishes, the next queued item
 takes over that pane.
 
+On a tty, when effective parallelism is 1 — a single work unit (one item,
+-n1/-L1 over single input, or no items) or an explicit -P1 — partty
+short-circuits to a straight pass-through: the invocation(s) run in
+submission order with stdout/stderr going straight to the terminal (colors,
+progress preserved) and stdin from /dev/null, no pane UI and no output
+capture. -S is a no-op in this mode. Each child runs in its own process
+group, so Ctrl-C / SIGTERM is forwarded to the whole group (pipeline members
+included) and a second signal escalates to SIGKILL; exit is the max child
+code, or 128+signal if interrupted. Pass-through is NOT interactive — a child
+can't read the terminal — which is the trade for clean teardown. (tty-only —
+see the non-tty note below.)
+
 When stdout is NOT a tty (pipes, CI, non-interactive shells), partty
-falls back to a plain parallel runner — no pane UI: each invocation runs
-with its combined stdout+stderr captured, and when it finishes its output
-is printed as one labeled block (`+ <command>` … `[exit N]`). Blocks are
-grouped per job (not line-interleaved) so parallel output stays readable.
-Exit code is still the max of all children.
+falls back to a plain runner — no pane UI, and no pass-through: each
+invocation runs with its combined stdout+stderr captured, and when it
+finishes its output is printed as one labeled block (`+ <command>` …
+`[exit N]`). Blocks are grouped per job (not line-interleaved) so parallel
+output stays readable, and the labels survive for anything parsing the
+output. Up to -P run in parallel (serial when parallelism is 1). Exit code
+is still the max of all children.
+
+Setting the environment variable NO_PARTTY (to any value other than empty /
+0 / false / no) forces serial execution regardless of -P or the number of
+work units — handy for tracing a partty buried inside a script. On a tty
+that's the raw pass-through above; off a tty it's the serial labeled runner.
 
 Options:
     -P PROCS         Max parallelism (default: os.cpu_count() or 4)
@@ -963,6 +982,100 @@ def build_invocations_lines(
     return out
 
 
+EXEC_FAILED_RC = 127
+
+
+def exec_failed_message(e: OSError) -> str:
+    """The message shown when a command can't even be started (rc 127).
+    Shared by both runners so the text can't drift between them."""
+    return f"partty: failed to exec: {e}"
+
+
+def aggregate_rc(rcs: list[int]) -> int:
+    """Overall exit status = the worst (max) child exit code, 0 if none ran.
+    Shared by every runner so the rule lives in one place."""
+    return max(rcs) if rcs else 0
+
+
+def signal_to_group(proc: subprocess.Popen, sig: int) -> None:
+    """Send `sig` to the child's whole process group (it was started with
+    start_new_session, so its pid is its group id) — reaching any pipeline
+    members / grandchildren it spawned. Falls back to the single pid if the
+    group is already gone."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.send_signal(sig)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def run_passthrough(invocations: list[list[str]]) -> int:
+    """Direct pass-through for the parallelism-1 case (tty only): run each
+    invocation in submission order with its stdout/stderr going straight to the
+    real terminal (colors, progress) and stdin from /dev/null. No pane UI, no
+    output capture, no `+ label` / `[exit N]` decoration. Returns the max exit
+    code, or 128+signal if interrupted.
+
+    Signals: each child gets its OWN session/process group (start_new_session),
+    so partty can forward a signal to the whole group — reaching pipeline
+    members / grandchildren — without signalling itself. We install our own
+    SIGINT/SIGTERM handlers for the duration so that (a) a signal delivered to
+    partty doesn't raise KeyboardInterrupt and spew a traceback, and (b) it's
+    forwarded to the child's group instead of orphaning it. The SECOND signal
+    escalates to SIGKILL (so a child that traps/ignores the first can still be
+    killed). On any signal we stop after the current child and return the
+    conventional 128+signal exit code. (This means pass-through is NOT
+    interactive — a child can't read the terminal — which is the deliberate
+    trade for clean, complete teardown.)
+    """
+    rcs: list[int] = []
+    current: list[subprocess.Popen | None] = [None]
+    caught: list[int | None] = [None]
+
+    def forward(signum, _frame):
+        # First signal: forward it to the child's group. Second signal:
+        # escalate to SIGKILL. Replacing the default handler is also what
+        # suppresses the KeyboardInterrupt traceback.
+        escalate = caught[0] is not None
+        caught[0] = signum
+        signal_to_group(current[0], signal.SIGKILL if escalate else signum)
+
+    prev_int = signal.signal(signal.SIGINT, forward)
+    prev_term = signal.signal(signal.SIGTERM, forward)
+    try:
+        for argv in invocations:
+            if caught[0] is not None:
+                break  # a signal arrived between children — don't start more
+            try:
+                proc = subprocess.Popen(
+                    argv, stdin=subprocess.DEVNULL, start_new_session=True
+                )
+            except OSError as e:
+                print(exec_failed_message(e), file=sys.stderr)
+                rcs.append(EXEC_FAILED_RC)
+                continue
+            current[0] = proc
+            if caught[0] is not None:
+                # Signal landed in the Popen→assignment gap: deliver it now.
+                signal_to_group(proc, caught[0])
+            proc.wait()
+            current[0] = None
+            rcs.append(proc.returncode)
+            if caught[0] is not None:
+                break
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+
+    if caught[0] is not None:
+        return 128 + caught[0]
+    return aggregate_rc(rcs)
+
+
 def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int:
     """Non-tty fallback: run invocations in parallel (up to `procs`), printing
     each one's combined output as a labeled block when it finishes. Output is
@@ -983,8 +1096,8 @@ def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int
             output = proc.stdout.decode("utf-8", "replace")
             rc = proc.returncode
         except OSError as e:
-            output = f"partty: failed to exec: {e}\n"
-            rc = 127
+            output = exec_failed_message(e) + "\n"
+            rc = EXEC_FAILED_RC
         if strip_ansi:
             output = ANSI_RE.sub("", output)
         block = [f"+ {label}\n", output]
@@ -1001,7 +1114,7 @@ def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int
         # map preserves submission order for rc collection; printing happens
         # in completion order inside run_one (guarded by out_lock).
         rcs = list(ex.map(run_one, invocations))
-    return max(rcs) if rcs else 0
+    return aggregate_rc(rcs)
 
 
 def main():
@@ -1020,9 +1133,34 @@ def main():
     procs = max(1, procs)
     strip_ansi = bool(args.strip_ansi)
 
+    # Debug escape hatch: NO_PARTTY collapses everything to serial — on a tty
+    # that's a raw pass-through (no pane UI), off a tty it's serial run_plain
+    # (still labeled). Setting procs=1 expresses both. Any value except empty /
+    # 0 / false / no (case-insensitive) enables.
+    if os.environ.get("NO_PARTTY", "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+    ):
+        procs = 1
+
     if not sys.stdout.isatty():
-        # No tty → no pane UI. Run plain (grouped parallel output) and exit.
+        # No tty → no pane UI, and anything consuming this output is parsing
+        # it: keep the documented `+ <command>` … `[exit N]` labeled blocks via
+        # run_plain. With procs==1 (single unit / -P1 / NO_PARTTY) this runs
+        # serially; otherwise up to `procs` in parallel. Pass-through is a
+        # tty-only optimization and deliberately does NOT pre-empt this.
         sys.exit(run_plain(invocations, procs, strip_ansi))
+
+    if procs == 1:
+        # On a tty, parallelism of one — a single work unit (one item, -n1/-L1
+        # over single input, or no items), an explicit -P1, or NO_PARTTY — buys
+        # nothing from the pane UI, so short-circuit to a straight pass-through:
+        # run the invocation(s) in order with inherited stdio so the command
+        # owns the real terminal (colors, progress bars, interactivity, exit
+        # code). -S has no effect in this mode since nothing intercepts output.
+        sys.exit(run_passthrough(invocations))
 
     def query_tty_size():
         # Skip shutil.get_terminal_size — it honors $LINES/$COLUMNS env vars
@@ -1329,7 +1467,7 @@ def main():
 
     if interrupted and not all_rcs:
         sys.exit(130)
-    sys.exit(max(all_rcs) if all_rcs else 0)
+    sys.exit(aggregate_rc(all_rcs))
 
 
 if __name__ == "__main__":
