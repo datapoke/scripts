@@ -76,6 +76,11 @@ Display:
 - Final exit code is the max of all child exit codes.
 """
 
+# PEP 604 unions (`str | None`) in signatures are evaluated at def time, which
+# fails on macOS's stock /usr/bin/python3 (3.9). Deferring annotations keeps
+# this runnable there; nothing here introspects them at runtime.
+from __future__ import annotations
+
 import argparse
 import codecs
 import concurrent.futures
