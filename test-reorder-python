@@ -761,30 +761,23 @@ def git_checkout(root: str, *dirs: str) -> str:
     return root
 
 
-@test("in a repo, an absolute path judges only the part below the repo")
-def t_repo_absolute():
+@test("an absolute path is judged as given, as the PHP judges it")
+def t_absolute_as_given():
+    # The shared limit: a checkout under a directory named tests/ is skipped
+    # when named absolutely. Named relatively (t_checkout_under_tests), it
+    # is reordered.
     with tempfile.TemporaryDirectory() as d:
-        proj = git_checkout(os.path.join(d, "tests", "proj"), ".")
+        proj = os.path.join(d, "tests", "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "x.py"), "w") as f:
+            f.write(SWAP_SRC)
         subprocess.run(
             [sys.executable, REORDER, "--write", os.path.join(proj, "x.py")],
             check=True,
         )
         with open(os.path.join(proj, "x.py")) as f:
-            assert_before(f.read(), "def caller", "def helper")
-
-
-@test("in a repo, a file under tests/ is skipped from any directory")
-def t_repo_tests_from_inside():
-    with tempfile.TemporaryDirectory() as d:
-        repo = git_checkout(d, "tests")
-        subprocess.run(
-            [sys.executable, REORDER, "--write", "x.py"],
-            cwd=os.path.join(repo, "tests"),
-            check=True,
-        )
-        with open(os.path.join(repo, "tests", "x.py")) as f:
             if f.read() != SWAP_SRC:
-                raise AssertionError("a test file was reordered")
+                raise AssertionError("an absolute tests/ path was reordered")
 
 
 @test("absolute paths work from a deleted working directory")
@@ -803,6 +796,21 @@ def t_deleted_cwd():
             raise AssertionError(f"exit {p.returncode}: {err!r}")
         with open(os.path.join(repo, "x.py")) as f:
             assert_before(f.read(), "def caller", "def helper")
+
+
+@test("a relative path from a deleted working directory fails that file")
+def t_deleted_cwd_relative():
+    with tempfile.TemporaryDirectory() as d:
+        gone = os.path.join(d, "gone")
+        os.makedirs(gone)
+        p = subprocess.Popen(
+            ["sh", "-c", 'rmdir "$0" && exec "$@"', gone, sys.executable, REORDER,
+             "--write", "x.py"],
+            cwd=gone, stderr=subprocess.PIPE,
+        )
+        _, err = p.communicate(timeout=10)
+    if p.returncode != 1 or b"Traceback" in err or b"x.py" not in err:
+        raise AssertionError(f"exit {p.returncode}: {err!r}")
 
 
 def main():
