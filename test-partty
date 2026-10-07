@@ -32,11 +32,11 @@ import contextlib
 import fcntl
 import os
 import pty
-import resource
 import re
+import resource
 import select
-import signal
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -912,7 +912,30 @@ def transcript_dir():
 
 
 def transcripts(d: str) -> list[str]:
-    return sorted(os.path.join(d, f) for f in os.listdir(d))
+    return sorted(
+        os.path.join(d, f) for f in os.listdir(d) if f.startswith("partty-")
+    )
+
+
+def wait_for_ready(d: str, n: int, timeout: float = 3.0) -> None:
+    """Block until `n` tasks have touched `$TMPDIR/ready-*`, so a signal
+    lands after partty and its tasks are up rather than after a guess."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if sum(f.startswith("ready-") for f in os.listdir(d)) >= n:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"{n} tasks never reported ready")
+
+
+def stray(command: str) -> bool:
+    """Whether a process running exactly `command` is still alive; kills any
+    it finds, so a failing test leaves nothing behind."""
+    pattern = "^" + re.escape(command) + "$"
+    found = subprocess.run(["pgrep", "-f", pattern], capture_output=True).stdout
+    if found:
+        subprocess.run(["pkill", "-9", "-f", pattern])
+    return bool(found)
 
 
 def read_bytes(path: str) -> bytes:
@@ -1094,14 +1117,21 @@ def t_transcript_plain_interrupt():
     os.close(w)
     with transcript_dir() as d:
         p = subprocess.Popen(
-            [PARSPLIT, "-P2", "sh", "-c", "echo started-$1; sleep 10", "_"],
+            [
+                PARSPLIT,
+                "-P2",
+                "sh",
+                "-c",
+                'echo started-$1; touch "$TMPDIR/ready-$1"; sleep 10',
+                "_",
+            ],
             stdin=r,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
         os.close(r)
-        time.sleep(0.5)
+        wait_for_ready(d, 2)
         os.killpg(p.pid, signal.SIGINT)
         try:
             _, err = p.communicate(timeout=5)
@@ -1118,6 +1148,170 @@ def t_transcript_plain_interrupt():
     assert_contains(err, b"partty: 2 of 2 tasks failed")
     if p.returncode != 130:
         raise AssertionError(f"expected exit 130, got {p.returncode}")
+
+
+@test("a transcript deleted mid-run doesn't crash partty off a tty")
+def t_transcript_deleted_plain():
+    script = '[ "$1" = a ] && rm -f "$TMPDIR"/partty-*.log; sleep 0.2'
+    with transcript_dir():
+        p = subprocess.run(
+            [PARSPLIT, "-P2", "sh", "-c", script, "_"],
+            input=PANED_STDIN,
+            capture_output=True,
+        )
+    assert_not_contains(p.stderr, b"Traceback")
+    if p.returncode != 0:
+        raise AssertionError(f"expected exit 0, got {p.returncode}")
+
+
+@test("a full transcript disk doesn't touch the task off a tty")
+def t_transcript_write_error_plain():
+    def limit():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (64, 64))
+
+    with transcript_dir():
+        p = subprocess.run(
+            [PARSPLIT, "sh", "-c", "head -c 65536 /dev/zero | tr '\\0' x; exit 3"],
+            input=b"",
+            capture_output=True,
+            preexec_fn=limit,
+        )
+    if b"x" * 65536 not in p.stdout:
+        raise AssertionError("the task's own output was cut short")
+    assert_contains(p.stderr, b"(incomplete: ")
+    if p.returncode != 3:
+        raise AssertionError(f"expected exit 3, got {p.returncode}")
+
+
+@test("tasks that cannot exec don't stall the queue")
+def t_transcript_exec_queue():
+    with transcript_dir() as d:
+        out, status = run_partty(
+            ["-P2", "/nonexistent/partty-cmd"], b"a\nb\nc\nd\n"
+        )
+        left = transcripts(d)
+    if exit_code(status) != 127:
+        raise AssertionError(f"expected exit 127, got {exit_code(status)}")
+    if len(left) != 4:
+        raise AssertionError(f"expected four transcripts, found {left}")
+    assert_contains(strip_ansi(out), b"partty: 4 of 4 tasks failed")
+
+
+@test("output still arriving at exit marks the transcript incomplete")
+def t_transcript_reader_deadline():
+    script = '[ "$1" = a ] || exit 0; (sleep 3; echo diag) & exit 1'
+    with transcript_dir():
+        out, _ = run_partty(["-P2", "sh", "-c", script, "_"], PANED_STDIN)
+    assert_contains(failure_report(out), b"(may be incomplete: ")
+
+
+@test("an interrupted pane run exits 128+signal")
+def t_transcript_pane_interrupt_status():
+    with transcript_dir():
+        _, status, _ = _run_and_signal_partty(
+            ["-P2", "sleep", "10"], PANED_STDIN, signal.SIGINT
+        )
+    if status is None or exit_code(status) != 130:
+        raise AssertionError(f"expected exit 130, got status {status}")
+
+
+def _spawn_plain(script: str) -> subprocess.Popen:
+    """partty off a tty over tasks a and b, in its own session."""
+    r, w = os.pipe()
+    os.write(w, PANED_STDIN)
+    os.close(w)
+    p = subprocess.Popen(
+        [PARSPLIT, "-P2", "sh", "-c", script, "_"],
+        stdin=r,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    os.close(r)
+    return p
+
+
+def _finish(p: subprocess.Popen) -> bytes:
+    try:
+        _, err = p.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        raise AssertionError("partty didn't exit after the signal")
+    return err
+
+
+@test("SIGTERM off a tty kills the tasks and lists them")
+def t_transcript_plain_sigterm():
+    with transcript_dir() as d:
+        p = _spawn_plain('touch "$TMPDIR/ready-$1"; sleep 10')
+        wait_for_ready(d, 2)
+        os.kill(p.pid, signal.SIGTERM)
+        err = _finish(p)
+    assert_contains(err, b"partty: 2 of 2 tasks failed")
+    if p.returncode != 143:
+        raise AssertionError(f"expected exit 143, got {p.returncode}")
+
+
+@test("a second Ctrl-C off a tty kills a task that ignores the first")
+def t_transcript_plain_escalate():
+    with transcript_dir() as d:
+        p = _spawn_plain("""trap '' INT; touch "$TMPDIR/ready-$1"; sleep 10""")
+        wait_for_ready(d, 2)
+        os.kill(p.pid, signal.SIGINT)
+        time.sleep(0.3)
+        os.kill(p.pid, signal.SIGINT)
+        err = _finish(p)
+    assert_not_contains(err, b"Traceback")
+    assert_contains(err, b"partty: 2 of 2 tasks failed")
+    if p.returncode != 130:
+        raise AssertionError(f"expected exit 130, got {p.returncode}")
+
+
+@test("a background process holding a task's output doesn't stall it")
+def t_transcript_plain_background():
+    with transcript_dir():
+        start = time.time()
+        p = subprocess.run(
+            [PARSPLIT, "sh", "-c", "sleep 29.7 & exit 1"],
+            input=b"",
+            capture_output=True,
+            timeout=10,
+        )
+        elapsed = time.time() - start
+    stray("sleep 29.7")
+    if elapsed > 3:
+        raise AssertionError(f"partty waited {elapsed:.1f}s on the background job")
+    assert_contains(p.stderr, b"(may be incomplete: ")
+    if p.returncode != 1:
+        raise AssertionError(f"expected exit 1, got {p.returncode}")
+
+
+@test("a signal reaches a task's group after its leader exits")
+def t_transcript_signal_orphans():
+    with transcript_dir() as d:
+        p = _spawn_plain('touch "$TMPDIR/ready-$1"; sleep 28.7 & exit 0')
+        wait_for_ready(d, 2)
+        os.kill(p.pid, signal.SIGTERM)
+        _finish(p)
+    time.sleep(0.2)
+    if stray("sleep 28.7"):
+        raise AssertionError("the background sleep outlived the SIGTERM")
+
+
+@test("a second Ctrl-C in the pane UI kills a task that ignores the first")
+def t_transcript_pane_escalate():
+    with transcript_dir():
+        _, status, elapsed = _run_and_signal_partty(
+            ["-P2", "sh", "-c", "trap '' INT; sleep 10", "_"],
+            PANED_STDIN,
+            signal.SIGINT,
+            sig2=signal.SIGINT,
+        )
+    if status is None or exit_code(status) != 130:
+        raise AssertionError(f"expected exit 130, got status {status}")
+    if elapsed > 2.0:
+        raise AssertionError(f"took {elapsed:.2f}s to exit")
 
 
 # ----------------------------------------------------------------------
@@ -1168,26 +1362,28 @@ def main():
     # Pad every name to the longest one (min 55) so the PASS/FAIL column
     # stays vertically aligned even when a test name overflows 55 chars.
     name_w = max(55, *(len(n) for n, _ in selected))
-    for name, fn in selected:
-        sys.stdout.write(f"  {name:<{name_w}s} ")
-        sys.stdout.flush()
-        try:
-            fn()
-        except AssertionError as e:
-            print(f"\033[1;31mFAIL\033[0m  {e}")
-            failed += 1
-            failed_names.append(name)
-            if args.verbose:
-                # Re-run the test inside a try/except to capture the output
-                # — but we already discarded it. Just note the test name.
-                pass
-        except Exception as e:
-            print(f"\033[1;31mERROR\033[0m {type(e).__name__}: {e}")
-            failed += 1
-            failed_names.append(name)
-        else:
-            print("\033[1;32mPASS\033[0m")
-            passed += 1
+    # Failing tasks leave transcripts; keep them out of the real TMPDIR.
+    with transcript_dir():
+        for name, fn in selected:
+            sys.stdout.write(f"  {name:<{name_w}s} ")
+            sys.stdout.flush()
+            try:
+                fn()
+            except AssertionError as e:
+                print(f"\033[1;31mFAIL\033[0m  {e}")
+                failed += 1
+                failed_names.append(name)
+                if args.verbose:
+                    # Re-run the test inside a try/except to capture the output
+                    # — but we already discarded it. Just note the test name.
+                    pass
+            except Exception as e:
+                print(f"\033[1;31mERROR\033[0m {type(e).__name__}: {e}")
+                failed += 1
+                failed_names.append(name)
+            else:
+                print("\033[1;32mPASS\033[0m")
+                passed += 1
 
     total = passed + failed
     color = "\033[1;32m" if failed == 0 else "\033[1;31m"

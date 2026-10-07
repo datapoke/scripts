@@ -94,6 +94,7 @@ import fcntl
 import os
 import pty
 import re
+import select
 import shlex
 import signal
 import struct
@@ -830,7 +831,7 @@ class Slot:
         "thread",
         "has_run",
         "task_index",
-        "transcript_path",
+        "transcript",
     )
 
     def __init__(self, output_lines: int, cols: int):
@@ -844,7 +845,7 @@ class Slot:
         self.thread: threading.Thread | None = None
         self.has_run = False
         self.task_index = -1
-        self.transcript_path: str | None = None
+        self.transcript: Transcript | None = None
 
 
 def set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -861,8 +862,7 @@ def set_winsize(fd: int, rows: int, cols: int) -> None:
 def reader(
     slot: Slot,
     master_fd: int,
-    transcript_fd: int,
-    on_transcript_error,
+    transcript: Transcript,
     redraw_event: threading.Event,
 ):
     """Stream the child pty's bytes into the slot's `VirtualPane`, and copy
@@ -870,10 +870,8 @@ def reader(
 
     The pane is the terminal emulator — cursor moves, erases, SGR, and
     CRLF translation all happen there. The reader is just a decode-and-feed
-    loop. It owns both fds and closes them at EOF, after the slot may
-    already be running its next task. A transcript write error ends the
-    transcript, never the drain: a reader that stops reading blocks the child.
-    `on_transcript_error(e)` records it for the failure list.
+    loop. It owns the pty fd and the transcript and closes both at EOF,
+    after the slot may already be running its next task.
     """
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
@@ -883,13 +881,7 @@ def reader(
             break
         if not chunk:
             break
-        if transcript_fd != -1:
-            try:
-                write_all(transcript_fd, chunk)
-            except OSError as e:
-                os.close(transcript_fd)
-                transcript_fd = -1
-                on_transcript_error(e)
+        transcript.write(chunk)
         text = decoder.decode(chunk)
         if not text:
             continue
@@ -901,8 +893,10 @@ def reader(
         with slot.lock:
             slot.screen.feed(final)
         redraw_event.set()
-    if transcript_fd != -1:
-        os.close(transcript_fd)
+    transcript.close()
+    with slot.lock:
+        if slot.master_fd == master_fd:  # else the slot has moved on
+            slot.master_fd = -1
     try:
         os.close(master_fd)
     except OSError:
@@ -1039,40 +1033,58 @@ def exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
-def open_transcript() -> tuple[int, str]:
-    """Create the temp file that holds one task's full output; returns its
-    fd and path."""
-    return tempfile.mkstemp(prefix="partty-", suffix=".log")
+READER_GRACE_S = 1.0  # drain after exit; a background job can hold output open
+LINGERING = "may be incomplete: a background process held its output open at exit"
 
 
-def write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view) :]
+class Transcript:
+    """One task's full output, in a temp file under $TMPDIR that `record`
+    unlinks when the task exits 0. A write error ends the file, never the
+    task; `note` then says why the file may stop short."""
+
+    def __init__(self) -> None:
+        self._fd, self.path = tempfile.mkstemp(prefix="partty-", suffix=".log")
+        self.note: str | None = None
+
+    def write(self, data: bytes) -> None:
+        if self._fd == -1:
+            return
+        view = memoryview(data)
+        try:
+            while view:
+                view = view[os.write(self._fd, view) :]
+        except OSError as e:
+            self.note = f"incomplete: {e}"
+            self.close()
+
+    def close(self) -> None:
+        if self._fd != -1:
+            os.close(self._fd)
+            self._fd = -1
+
+    def discard(self) -> None:
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass  # a tmp reaper got there first
 
 
 # One slot per invocation, in input order; None until that task finishes.
-Results = list["tuple[str, int, str | None] | None"]
+Results = list["tuple[str, int, Transcript | None] | None"]
 
 
 def record(
-    results: Results, index: int, label: str, rc: int, transcript: str | None
+    results: Results, index: int, label: str, rc: int, transcript: Transcript | None
 ) -> None:
-    """Record a finished task, unlinking its transcript when it exits 0."""
+    """Record a finished task, discarding its transcript when it exits 0."""
     if rc == 0 and transcript is not None:
-        try:
-            os.unlink(transcript)
-        except FileNotFoundError:
-            pass  # a tmp reaper got there first
+        transcript.discard()
     results[index] = (label, rc, transcript)
 
 
-def report_failures(
-    results: Results, incomplete: dict[str, str] | None = None
-) -> int:
+def report_failures(results: Results) -> int:
     """List each failed task and its transcript on stderr, in input order;
-    return the overall exit status. `incomplete` maps a transcript path to
-    the write error that cut it short."""
+    return the overall exit status."""
     finished = [r for r in results if r is not None]
     failed = [r for r in finished if r[1] != 0]
     if failed:
@@ -1080,27 +1092,69 @@ def report_failures(
         for label, rc, transcript in failed:
             lines.append(f"  [exit {rc}] {label}")
             if transcript is not None:
-                note = (incomplete or {}).get(transcript)
-                suffix = f"  (incomplete: {note})" if note else ""
-                lines.append(f"    {transcript}{suffix}")
+                note = f"  ({transcript.note})" if transcript.note else ""
+                lines.append(f"    {transcript.path}{note}")
         print("\n".join(lines), file=sys.stderr, flush=True)
     return aggregate_rc([rc for _, rc, _ in finished])
 
 
 def signal_to_group(proc: subprocess.Popen, sig: int) -> None:
     """Send `sig` to the child's whole process group (it was started with
-    start_new_session, so its pid is its group id) — reaching any pipeline
-    members / grandchildren it spawned. Falls back to the single pid if the
-    group is already gone."""
-    if proc is None or proc.poll() is not None:
-        return
+    start_new_session, so its pid is its group id), reaching pipeline members
+    and background processes even after the leader has exited. The caller
+    holds the leader unreaped, so its pid, and the group id, can't be reused."""
     try:
         os.killpg(proc.pid, sig)
-    except (ProcessLookupError, OSError):
-        try:
-            proc.send_signal(sig)
-        except (ProcessLookupError, OSError):
-            pass
+    except (ProcessLookupError, PermissionError):
+        pass  # gone, or (macOS: EPERM) only the zombie leader is left
+
+
+class Forwarder:
+    """SIGINT/SIGTERM for every runner. Each child runs in its own session,
+    so a signal reaches partty alone; the first is forwarded to every
+    unreaped child's process group, and any later one goes as SIGKILL so a
+    child that traps the first still dies. Owning the handlers also keeps
+    KeyboardInterrupt (and its traceback) away. `caught` is the last signal
+    received, None until one arrives; a runner starts no task after it."""
+
+    def __init__(self) -> None:
+        self.caught: int | None = None
+        self._escalated = False
+        self._procs: set[subprocess.Popen] = set()
+
+    def __enter__(self) -> "Forwarder":
+        self._prev = {
+            s: signal.signal(s, self._forward) for s in (signal.SIGINT, signal.SIGTERM)
+        }
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for s, handler in self._prev.items():
+            signal.signal(s, handler)
+
+    def _forward(self, signum, _frame) -> None:
+        # No lock: the thread it interrupted might hold it. GIL-atomic sets.
+        self._escalated = self.caught is not None
+        self.caught = signum
+        for proc in list(self._procs):
+            signal_to_group(proc, self._signal())
+
+    def _signal(self) -> int:
+        return signal.SIGKILL if self._escalated else self.caught
+
+    def popen(self, argv: list[str], **kw) -> subprocess.Popen:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, start_new_session=True, **kw
+        )
+        self._procs.add(proc)
+        if self.caught is not None:
+            signal_to_group(proc, self._signal())  # it landed during Popen
+        return proc
+
+    def reap(self, proc: subprocess.Popen) -> int:
+        proc.wait()
+        self._procs.discard(proc)
+        return exit_status(proc.returncode)
 
 
 def run_passthrough(invocations: list[list[str]]) -> int:
@@ -1110,93 +1164,80 @@ def run_passthrough(invocations: list[list[str]]) -> int:
     output capture, no `+ label` / `[exit N]` decoration. Lists failed tasks
     on stderr, and returns the max exit code, or 128+signal if interrupted.
 
-    Signals: each child gets its OWN session/process group (start_new_session),
-    so partty can forward a signal to the whole group — reaching pipeline
-    members / grandchildren — without signalling itself. We install our own
-    SIGINT/SIGTERM handlers for the duration so that (a) a signal delivered to
-    partty doesn't raise KeyboardInterrupt and spew a traceback, and (b) it's
-    forwarded to the child's group instead of orphaning it. The SECOND signal
-    escalates to SIGKILL (so a child that traps/ignores the first can still be
-    killed). On any signal we stop after the current child and return the
-    conventional 128+signal exit code. (This means pass-through is NOT
-    interactive — a child can't read the terminal — which is the deliberate
-    trade for clean, complete teardown.)
+    Signals go through `Forwarder`: on any signal we stop after the current
+    child and return the conventional 128+signal exit code. (Each child runs
+    in its own session, so pass-through is NOT interactive — a child can't
+    read the terminal — which is the deliberate trade for clean, complete
+    teardown.)
     """
     results: Results = [None] * len(invocations)
-    current: list[subprocess.Popen | None] = [None]
-    caught: list[int | None] = [None]
-
-    def forward(signum, _frame):
-        # First signal: forward it to the child's group. Second signal:
-        # escalate to SIGKILL. Replacing the default handler is also what
-        # suppresses the KeyboardInterrupt traceback.
-        escalate = caught[0] is not None
-        caught[0] = signum
-        signal_to_group(current[0], signal.SIGKILL if escalate else signum)
-
-    prev_int = signal.signal(signal.SIGINT, forward)
-    prev_term = signal.signal(signal.SIGTERM, forward)
-    try:
+    with Forwarder() as fwd:
         for index, argv in enumerate(invocations):
-            if caught[0] is not None:
-                break  # a signal arrived between children — don't start more
+            if fwd.caught is not None:
+                break  # a signal arrived — don't start more
             label = format_argv(argv)
             try:
-                proc = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, start_new_session=True
-                )
+                proc = fwd.popen(argv)
             except OSError as e:
                 print(exec_failed_message(e), file=sys.stderr)
                 record(results, index, label, EXEC_FAILED_RC, None)
                 continue
-            current[0] = proc
-            if caught[0] is not None:
-                # Signal landed in the Popen→assignment gap: deliver it now.
-                signal_to_group(proc, caught[0])
-            proc.wait()
-            current[0] = None
-            record(results, index, label, exit_status(proc.returncode), None)
-            if caught[0] is not None:
-                break
-    finally:
-        signal.signal(signal.SIGINT, prev_int)
-        signal.signal(signal.SIGTERM, prev_term)
+            record(results, index, label, fwd.reap(proc), None)
 
     rc = report_failures(results)
-    if caught[0] is not None:
-        return 128 + caught[0]
-    return rc
+    return rc if fwd.caught is None else 128 + fwd.caught
+
+
+def drain(proc: subprocess.Popen, transcript: Transcript) -> bytearray:
+    """Read the task's stdout into memory and its transcript until EOF, or
+    until READER_GRACE_S after the task exits, then close the pipe."""
+    data = bytearray()
+    fd = proc.stdout.fileno()
+    deadline = None
+    while True:
+        if deadline is None and proc.poll() is not None:
+            deadline = time.monotonic() + READER_GRACE_S
+        timeout = 0.1 if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            transcript.note = transcript.note or LINGERING
+            break
+        if select.select([fd], [], [], timeout)[0]:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+            transcript.write(chunk)
+    proc.stdout.close()
+    return data
 
 
 def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int:
     """Non-tty fallback: run invocations in parallel (up to `procs`), printing
     each one's combined output as a labeled block when it finishes. Output is
     grouped per job (buffered to completion) — not line-interleaved — so
-    parallel logs stay attributable. The transcript file is the buffer.
-    Lists failed tasks on stderr, and returns the max child exit code.
+    parallel logs stay attributable. Signals go through `Forwarder`, and a
+    signal also drops the queue. Lists failed tasks on stderr, and returns
+    the max child exit code, or 128+signal if interrupted.
     """
     out_lock = threading.Lock()
     results: Results = [None] * len(invocations)
 
-    def run_one(index: int, argv: list[str]) -> None:
+    def run_one(fwd: Forwarder, index: int, argv: list[str]) -> None:
+        if fwd.caught is not None:
+            return  # queued behind a signal
         label = format_argv(argv)
-        transcript_fd, transcript = open_transcript()
+        transcript = Transcript()
         try:
-            rc = exit_status(
-                subprocess.run(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=transcript_fd,
-                    stderr=subprocess.STDOUT,
-                ).returncode
-            )
+            proc = fwd.popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         except OSError as e:
-            write_all(transcript_fd, (exec_failed_message(e) + "\n").encode())
+            data = (exec_failed_message(e) + "\n").encode()
+            transcript.write(data)
             rc = EXEC_FAILED_RC
-        finally:
-            os.close(transcript_fd)
-        with open(transcript, "rb") as f:
-            output = f.read().decode("utf-8", "replace")
+        else:
+            data = drain(proc, transcript)
+            rc = fwd.reap(proc)
+        transcript.close()
+        output = bytes(data).decode("utf-8", "replace")
         if strip_ansi:
             output = ANSI_RE.sub("", output)
         block = [f"+ {label}\n", output]
@@ -1208,19 +1249,16 @@ def run_plain(invocations: list[list[str]], procs: int, strip_ansi: bool) -> int
             sys.stdout.flush()
             record(results, index, label, rc, transcript)
 
-    interrupted = False
-    with concurrent.futures.ThreadPoolExecutor(max_workers=procs) as ex:
-        futures = [ex.submit(run_one, *job) for job in enumerate(invocations)]
-        try:
+    with Forwarder() as fwd:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=procs) as ex:
+            futures = [
+                ex.submit(run_one, fwd, index, argv)
+                for index, argv in enumerate(invocations)
+            ]
             for f in futures:
                 f.result()
-        except KeyboardInterrupt:
-            # The children shared the Ctrl-C; drop the queue, let them reap.
-            interrupted = True
-            for f in futures:
-                f.cancel()
     rc = report_failures(results)
-    return 128 + signal.SIGINT if interrupted else rc
+    return rc if fwd.caught is None else 128 + fwd.caught
 
 
 def main():
@@ -1315,20 +1353,17 @@ def main():
 
     queue = list(invocations)
     queue_idx = 0
-    queue_lock = threading.Lock()
+    fwd = Forwarder()
 
     def next_task() -> tuple[int, list[str]] | None:
         nonlocal queue_idx
-        with queue_lock:
-            if queue_idx >= len(queue):
-                return None
-            task = (queue_idx, queue[queue_idx])
-            queue_idx += 1
-            return task
+        if fwd.caught is not None or queue_idx >= len(queue):
+            return None
+        queue_idx += 1
+        return queue_idx - 1, queue[queue_idx - 1]
 
     results: Results = [None] * len(invocations)
-    readers: list[threading.Thread] = []
-    incomplete: dict[str, str] = {}
+    readers: list[tuple[threading.Thread, Transcript]] = []
 
     out = sys.stdout
     out.write(HIDE_CURSOR)
@@ -1344,7 +1379,6 @@ def main():
     redraw_event = threading.Event()
     need_resize = threading.Event()
     draw_lock = threading.Lock()
-    interrupted = False
     # Previous frame's rendered rows (without CLEAR_LINE/cursor moves).
     # Used to diff against the new frame so we only clear+rewrite rows
     # that actually changed — flicker fix. Empty list = nothing rendered
@@ -1423,12 +1457,13 @@ def main():
             slot_ol = new_ol[i]
             with slot.lock:
                 slot.screen.resize(max(1, slot_ol), max(1, new_cols))
-            if slot.master_fd != -1:
-                set_winsize(slot.master_fd, max(1, slot_ol), max(1, new_cols))
+                if slot.master_fd != -1:
+                    set_winsize(slot.master_fd, max(1, slot_ol), max(1, new_cols))
         term_rows, term_cols = new_rows, new_cols
         rows_per_pane, output_lines, total_lines = new_rpp, new_ol, new_tl
 
-    def start_task(slot: Slot, index: int, argv: list[str]) -> None:
+    def start_task(slot: Slot, index: int, argv: list[str]) -> bool:
+        """Start `argv` in `slot`; False when it fails to exec."""
         # Each slot's pane has its own height (the first few panes carry
         # the layout remainder so the block fills the available rows).
         slot_idx = slots.index(slot)
@@ -1441,9 +1476,9 @@ def main():
             slot.rc = None
             slot.has_run = True
         master_fd, slave_fd = pty.openpty()
-        transcript_fd, transcript = open_transcript()
+        transcript = Transcript()
         slot.task_index = index
-        slot.transcript_path = transcript
+        slot.transcript = transcript
         set_winsize(slave_fd, pane_rows, pane_cols)
         # Tell the child its terminal size via env too — many tools read
         # LINES / COLUMNS instead of (or in addition to) TIOCGWINSZ.
@@ -1452,150 +1487,106 @@ def main():
         env["COLUMNS"] = str(pane_cols)
         env["TERM"] = env.get("TERM", "xterm-256color")
         try:
-            proc = subprocess.Popen(
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                close_fds=True,
-                start_new_session=True,
-                env=env,
+            proc = fwd.popen(
+                argv, stdout=slave_fd, stderr=slave_fd, close_fds=True, env=env
             )
         except OSError as e:
             os.close(slave_fd)
             os.close(master_fd)
             message = exec_failed_message(e)
-            write_all(transcript_fd, (message + "\n").encode())
-            os.close(transcript_fd)
+            transcript.write((message + "\n").encode())
+            transcript.close()
             with slot.lock:
                 slot.screen.feed(message + "\r\n")
                 slot.done = True
                 slot.rc = EXEC_FAILED_RC
             record(results, index, slot.cmd_label, EXEC_FAILED_RC, transcript)
             redraw_event.set()
-            return
+            return False
         os.close(slave_fd)
-        slot.master_fd = master_fd
+        with slot.lock:
+            slot.master_fd = master_fd
         slot.proc = proc
         slot.thread = threading.Thread(
             target=reader,
-            args=(
-                slot,
-                master_fd,
-                transcript_fd,
-                lambda e: incomplete.__setitem__(transcript, str(e)),
-                redraw_event,
-            ),
+            args=(slot, master_fd, transcript, redraw_event),
             daemon=True,
         )
         slot.thread.start()
-        readers.append(slot.thread)
+        readers.append((slot.thread, transcript))
+        return True
 
-    # Initial dispatch
-    for slot in slots:
-        task = next_task()
-        if task is not None:
-            start_task(slot, *task)
-
-    def shutdown_signal_handler(_signum, _frame):
-        # First signal: SIGTERM all children + drain queue. Second signal
-        # (or any later): SIGKILL — the user is impatient or a child won't
-        # die gracefully. Wake the main loop so it notices and exits.
-        nonlocal interrupted
-        nonlocal queue_idx
-        escalate = interrupted  # already received one signal?
-        interrupted = True
-        with queue_lock:
-            queue_idx = len(queue)
-        sig = signal.SIGKILL if escalate else signal.SIGTERM
-        for slot in slots:
-            if slot.proc is not None and slot.proc.poll() is None:
-                try:
-                    os.killpg(slot.proc.pid, sig)
-                except Exception:
-                    try:
-                        slot.proc.send_signal(sig)
-                    except Exception:
-                        pass
-        # Make the main loop's redraw_event.wait() return immediately so
-        # the loop re-checks all_idle and exits as soon as the children
-        # are reaped.
-        redraw_event.set()
+    def dispatch(slot: Slot) -> None:
+        """Start the next queued task in `slot`, skipping past any that fail
+        to exec: nothing else would hand the slot another task."""
+        while (task := next_task()) is not None:
+            if start_task(slot, *task):
+                return
 
     def sigwinch_handler(_signum, _frame):
         need_resize.set()
         redraw_event.set()
 
-    signal.signal(signal.SIGINT, shutdown_signal_handler)
-    signal.signal(signal.SIGTERM, shutdown_signal_handler)
     try:
         signal.signal(signal.SIGWINCH, sigwinch_handler)
     except (AttributeError, ValueError):
         pass
 
     def all_idle() -> bool:
-        # `done`, not `poll()`: a child that exits after the loop's completion
-        # pass must still be recorded before the loop ends.
+        # `done`, not poll(): a late exit must be recorded before we stop.
         for slot in slots:
             if not slot.done:
                 return False
-        with queue_lock:
-            if queue_idx < len(queue):
-                return False
-        return True
+        return fwd.caught is not None or queue_idx >= len(queue)
 
     try:
-        while not all_idle():
-            redraw_event.wait(timeout=1.0 / REDRAW_HZ)
-            redraw_event.clear()
-            if need_resize.is_set():
-                need_resize.clear()
-                do_resize()
-            # Detect finished tasks and record rc; defer dispatching the
-            # next task until AFTER a redraw, so the completed task's
-            # final screen state (with [exit N] header) is rendered at
-            # least once before start_task resets the pane for reuse.
-            newly_completed: list[Slot] = []
+        with fwd:
             for slot in slots:
-                if slot.proc is None:
-                    continue
-                rc = slot.proc.poll()
-                if rc is not None and not slot.done:
-                    rc = exit_status(rc)
-                    if slot.thread is not None:
-                        slot.thread.join(timeout=0.1)
-                    with slot.lock:
-                        slot.done = True
-                        slot.rc = rc
-                    record(
-                        results,
-                        slot.task_index,
-                        slot.cmd_label,
-                        rc,
-                        slot.transcript_path,
-                    )
-                    newly_completed.append(slot)
-            if newly_completed:
+                dispatch(slot)
+            while not all_idle():
+                redraw_event.wait(timeout=1.0 / REDRAW_HZ)
+                redraw_event.clear()
+                if need_resize.is_set():
+                    need_resize.clear()
+                    do_resize()
+                # Detect finished tasks and record rc; defer dispatching the
+                # next task until AFTER a redraw, so the completed task's
+                # final screen state (with [exit N] header) is rendered at
+                # least once before start_task resets the pane for reuse.
+                newly_completed: list[Slot] = []
+                for slot in slots:
+                    if slot.proc is None:
+                        continue
+                    if slot.proc.poll() is not None and not slot.done:
+                        rc = fwd.reap(slot.proc)
+                        if slot.thread is not None:
+                            slot.thread.join(timeout=0.1)
+                        with slot.lock:
+                            slot.done = True
+                            slot.rc = rc
+                        record(
+                            results, slot.task_index, slot.cmd_label, rc, slot.transcript
+                        )
+                        newly_completed.append(slot)
+                if newly_completed:
+                    redraw()
+                for slot in newly_completed:
+                    dispatch(slot)
                 redraw()
-            for slot in newly_completed:
-                task = next_task()
-                if task is not None:
-                    start_task(slot, *task)
+            # Join every reader, a reused slot's earlier ones too, then redraw.
+            deadline = time.monotonic() + READER_GRACE_S
+            for t, transcript in readers:
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+                if t.is_alive():
+                    transcript.note = transcript.note or LINGERING
             redraw()
-        # Final pass — join every reader (a reused slot's earlier ones too)
-        # so kept transcripts are complete, then refresh the display.
-        deadline = time.monotonic() + 1.0
-        for t in readers:
-            t.join(timeout=max(0.0, deadline - time.monotonic()))
-        redraw()
     finally:
         out.write(f"\x1b[{total_lines}B\r")
         out.write(SHOW_CURSOR)
         out.flush()
 
-    if interrupted and not any(results):
-        sys.exit(130)
-    sys.exit(report_failures(results, incomplete))
+    rc = report_failures(results)
+    sys.exit(rc if fwd.caught is None else 128 + fwd.caught)
 
 
 if __name__ == "__main__":
