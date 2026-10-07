@@ -1199,9 +1199,10 @@ def t_transcript_exec_queue():
 
 @test("output still arriving at exit marks the transcript incomplete")
 def t_transcript_reader_deadline():
-    script = '[ "$1" = a ] || exit 0; (sleep 3; echo diag) & exit 1'
+    script = '[ "$1" = a ] || exit 0; (sleep 3.17; echo diag) & exit 1'
     with transcript_dir():
         out, _ = run_partty(["-P2", "sh", "-c", script, "_"], PANED_STDIN)
+    stray("sleep 3.17")
     assert_contains(failure_report(out), b"(may be incomplete: ")
 
 
@@ -1312,6 +1313,28 @@ def t_transcript_pane_escalate():
         raise AssertionError(f"expected exit 130, got status {status}")
     if elapsed > 2.0:
         raise AssertionError(f"took {elapsed:.2f}s to exit")
+
+
+@test("a finished task's background output stays out of the next pane")
+def t_transcript_pane_isolation():
+    # a exits at once, leaving a job that writes 0.3s later; c takes a's
+    # pane meanwhile and must not show it.
+    script = 'case "$1" in a) (sleep 0.3; echo "diag-$1") & exit 1;; *) sleep 1;; esac'
+    with transcript_dir() as d:
+        out, _ = run_partty(["-P2", "sh", "-c", script, "_"], b"a\nb\nc\n")
+        kept = [read_bytes(f) for f in transcripts(d)]
+    assert_not_contains(strip_ansi(out), b"diag-a", "a's output in c's pane")
+    if len(kept) != 1 or b"diag-a" not in kept[0]:
+        raise AssertionError(f"a's transcript should hold diag-a: {kept}")
+
+
+@test("every exec failure's pane is drawn before the pane is reused")
+def t_transcript_exec_drawn():
+    with transcript_dir():
+        out, _ = run_partty(["-P2", "/nonexistent/partty-cmd"], b"a\nb\nc\nd\n")
+    plain = strip_ansi(out)
+    for item in (b"a", b"b", b"c", b"d"):
+        assert_contains(plain, b"partty-cmd " + item + b"  [exit 127]")
 
 
 # ----------------------------------------------------------------------

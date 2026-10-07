@@ -862,11 +862,13 @@ def set_winsize(fd: int, rows: int, cols: int) -> None:
 def reader(
     slot: Slot,
     master_fd: int,
+    screen: VirtualPane,
     transcript: Transcript,
     redraw_event: threading.Event,
 ):
-    """Stream the child pty's bytes into the slot's `VirtualPane`, and copy
-    them raw into the task's transcript.
+    """Stream the child pty's bytes into its task's `screen`, and copy them
+    raw into the task's transcript. Once the slot moves on, `screen` is no
+    longer drawn, so a lingering job's output reaches only the transcript.
 
     The pane is the terminal emulator — cursor moves, erases, SGR, and
     CRLF translation all happen there. The reader is just a decode-and-feed
@@ -886,12 +888,12 @@ def reader(
         if not text:
             continue
         with slot.lock:
-            slot.screen.feed(text)
+            screen.feed(text)
         redraw_event.set()
     final = decoder.decode(b"", final=True)
     if final:
         with slot.lock:
-            slot.screen.feed(final)
+            screen.feed(final)
         redraw_event.set()
     transcript.close()
     with slot.lock:
@@ -1098,6 +1100,29 @@ def report_failures(results: Results) -> int:
     return aggregate_rc([rc for _, rc, _ in finished])
 
 
+def exited(proc: subprocess.Popen, block: bool = False) -> bool:
+    """Whether the child has exited, leaving it unreaped so its pid, and so
+    its process group id, can't be reused while `signal_to_group` may aim at
+    it; `block` waits for the exit. macOS's Python before 3.13 has no
+    os.waitid, so kqueue answers there."""
+    if proc.returncode is not None:
+        return True
+    if hasattr(os, "waitid"):
+        flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
+        return os.waitid(os.P_PID, proc.pid, flags) is not None
+    kq = select.kqueue()
+    try:
+        flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
+        event = select.kevent(
+            proc.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT
+        )
+        return bool(kq.control([event], 1, None if block else 0))
+    except ProcessLookupError:
+        return True  # registering on a zombie fails with ESRCH
+    finally:
+        kq.close()
+
+
 def signal_to_group(proc: subprocess.Popen, sig: int) -> None:
     """Send `sig` to the child's whole process group (it was started with
     start_new_session, so its pid is its group id), reaching pipeline members
@@ -1152,8 +1177,11 @@ class Forwarder:
             signal.signal(s, handler)
 
     def reap(self, proc: subprocess.Popen) -> int:
-        proc.wait()
+        """Wait for the child to exit, stop forwarding to it, then reap it;
+        in that order, no signal can reach a pid freed for reuse."""
+        exited(proc, block=True)
         self._procs.discard(proc)
+        proc.wait()
         return exit_status(proc.returncode)
 
 
@@ -1195,7 +1223,7 @@ def drain(proc: subprocess.Popen, transcript: Transcript) -> bytearray:
     fd = proc.stdout.fileno()
     deadline = None
     while True:
-        if deadline is None and proc.poll() is not None:
+        if deadline is None and exited(proc):
             deadline = time.monotonic() + READER_GRACE_S
         timeout = 0.1 if deadline is None else deadline - time.monotonic()
         if timeout <= 0:
@@ -1509,7 +1537,7 @@ def main():
         slot.proc = proc
         slot.thread = threading.Thread(
             target=reader,
-            args=(slot, master_fd, transcript, redraw_event),
+            args=(slot, master_fd, slot.screen, transcript, redraw_event),
             daemon=True,
         )
         slot.thread.start()
@@ -1522,6 +1550,7 @@ def main():
         while (task := next_task()) is not None:
             if start_task(slot, *task):
                 return
+            redraw()  # show the failure before the pane is reused
 
     def sigwinch_handler(_signum, _frame):
         need_resize.set()
@@ -1557,7 +1586,7 @@ def main():
                 for slot in slots:
                     if slot.proc is None:
                         continue
-                    if slot.proc.poll() is not None and not slot.done:
+                    if not slot.done and exited(slot.proc):
                         rc = fwd.reap(slot.proc)
                         if slot.thread is not None:
                             slot.thread.join(timeout=0.1)
