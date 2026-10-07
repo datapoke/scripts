@@ -170,16 +170,17 @@ def is_test_code(f: str) -> bool:
     ordering, and a double mirrors the order of the class it stands in for.
 
     The argument is judged as given, as the PHP twin judges it, so an
-    absolute path under a directory named tests/ is skipped. A symlink is
-    also judged by its target relative to the link's own directory,
-    because --write rewrites the target.
+    absolute path under a directory named tests/ is skipped. Because
+    --write rewrites through symlinks, the path the argument resolves to is
+    judged too: relative to the real working directory for a relative
+    argument, whole for an absolute one.
     """
     if is_test_path(f):
         return True
-    if not os.path.islink(f):
-        return False
-    here = os.path.realpath(os.path.dirname(f) or ".")
-    return is_test_path(os.path.relpath(os.path.realpath(f), here))
+    real = os.path.realpath(f)
+    if os.path.isabs(f):
+        return is_test_path(real)
+    return is_test_path(os.path.relpath(real, os.path.realpath(".")))
 
 
 def is_test_path(path: str) -> bool:

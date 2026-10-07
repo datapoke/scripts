@@ -750,17 +750,6 @@ def t_checkout_under_tests():
             assert_before(f.read(), "def caller", "def helper")
 
 
-def git_checkout(root: str, *dirs: str) -> str:
-    """A fake repo at `root` (a .git marker) holding SWAP_SRC at each of
-    `dirs`/x.py; returns root."""
-    os.makedirs(os.path.join(root, ".git"))
-    for sub in dirs:
-        os.makedirs(os.path.join(root, sub), exist_ok=True)
-        with open(os.path.join(root, sub, "x.py"), "w") as f:
-            f.write(SWAP_SRC)
-    return root
-
-
 @test("an absolute path is judged as given, as the PHP judges it")
 def t_absolute_as_given():
     # The shared limit: a checkout under a directory named tests/ is skipped
@@ -783,7 +772,10 @@ def t_absolute_as_given():
 @test("absolute paths work from a deleted working directory")
 def t_deleted_cwd():
     with tempfile.TemporaryDirectory() as d:
-        repo = git_checkout(os.path.join(d, "repo"), ".")
+        repo = os.path.join(d, "repo")
+        os.makedirs(repo)
+        with open(os.path.join(repo, "x.py"), "w") as f:
+            f.write(SWAP_SRC)
         gone = os.path.join(d, "gone")
         os.makedirs(gone)
         p = subprocess.Popen(
@@ -811,6 +803,21 @@ def t_deleted_cwd_relative():
         _, err = p.communicate(timeout=10)
     if p.returncode != 1 or b"Traceback" in err or b"x.py" not in err:
         raise AssertionError(f"exit {p.returncode}: {err!r}")
+
+
+@test("a path through a symlinked directory into tests/ is skipped")
+def t_symlinked_dir_into_tests():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "tests"))
+        with open(os.path.join(d, "tests", "x.py"), "w") as f:
+            f.write(SWAP_SRC)
+        os.symlink("tests", os.path.join(d, "t"))
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "t/x.py"], cwd=d, check=True
+        )
+        with open(os.path.join(d, "tests", "x.py")) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a test file was reordered through t/")
 
 
 def main():
