@@ -66,6 +66,7 @@ import ast
 import contextlib
 import io
 import os
+import pathlib
 import re
 import sys
 import tempfile
@@ -129,15 +130,10 @@ def main(argv: list[str]) -> int:
     failed = False
     for f in files:
         try:
-            skip = is_test_code(f)
-        except (OSError, ValueError) as e:  # getcwd gone; another drive
-            print(f"✗ {f}: {e}", file=sys.stderr)
-            failed = True
-            continue
-        if skip:
-            continue
-        try:
-            with open(f, "rb") as fh:
+            real = os.path.realpath(f)  # resolved once: judged, read, written
+            if is_test_code(f, real):
+                continue
+            with open(real, "rb") as fh:
                 data = fh.read()
             encoding = tokenize.detect_encoding(io.BytesIO(data).readline)[0]
             src = data.decode(encoding)
@@ -155,7 +151,7 @@ def main(argv: list[str]) -> int:
             print(f"✗ {f}: INVARIANT VIOLATION — aborted", file=sys.stderr)
             failed = True
             continue
-        if "--write" in flags and not write_atomic(f, new):
+        if "--write" in flags and not write_atomic(real, new):
             print(f"✗ {f}: write failed", file=sys.stderr)
             failed = True
             continue
@@ -165,22 +161,27 @@ def main(argv: list[str]) -> int:
     return 1 if failed else 0
 
 
-def is_test_code(f: str) -> bool:
+def is_test_code(f: str, real: str) -> bool:
     """Test code is left alone: its methods form no call graph worth
     ordering, and a double mirrors the order of the class it stands in for.
 
-    The argument is judged as given, as the PHP twin judges it, so an
-    absolute path under a directory named tests/ is skipped. Because
-    --write rewrites through symlinks, the path the argument resolves to is
-    judged too: relative to the real working directory for a relative
-    argument, whole for an absolute one.
+    The argument `f` is judged as given, as the PHP twin judges it, so an
+    absolute path under a directory named tests/ is skipped. --write
+    rewrites `real`, what `f` resolves to, so at every symlink along `f`
+    the file is judged again relative to that link's own directory: a
+    link, or a linked directory, into a tests/ tree is skipped wherever the
+    command runs.
     """
     if is_test_path(f):
         return True
-    real = os.path.realpath(f)
-    if os.path.isabs(f):
-        return is_test_path(real)
-    return is_test_path(os.path.relpath(real, os.path.realpath(".")))
+    parts = pathlib.PurePath(f).parts
+    for i in range(1, len(parts) + 1):
+        prefix = os.path.join(*parts[:i])
+        if os.path.islink(prefix):
+            base = os.path.realpath(os.path.dirname(prefix) or ".")
+            if is_test_path(os.path.relpath(real, base)):
+                return True
+    return False
 
 
 def is_test_path(path: str) -> bool:
@@ -602,9 +603,8 @@ def shape(src: str) -> list:
 
 
 def write_atomic(path: str, data: bytes) -> bool:
-    """Write through a temp file beside the real file, then rename it into
-    place; a symlink keeps pointing at the rewritten target."""
-    path = os.path.realpath(path)
+    """Write through a temp file beside `path`, a resolved real path, then
+    rename it into place; a symlink to it keeps pointing at it."""
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".reorder")

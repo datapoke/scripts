@@ -820,6 +820,39 @@ def t_symlinked_dir_into_tests():
                 raise AssertionError("a test file was reordered through t/")
 
 
+@test("a link above the working directory into its tests/ is skipped")
+def t_link_above_cwd():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "tests"))
+        with open(os.path.join(d, "tests", "fake.py"), "w") as f:
+            f.write(SWAP_SRC)
+        os.symlink("tests/fake.py", os.path.join(d, "shim.py"))
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "../shim.py"],
+            cwd=os.path.join(d, "tests"),
+            check=True,
+        )
+        with open(os.path.join(d, "tests", "fake.py")) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a test file was reordered through ../shim.py")
+
+
+@test("an absolute path through a symlinked directory into tests/ is skipped")
+def t_absolute_through_dir_link():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "tests"))
+        with open(os.path.join(d, "tests", "x.py"), "w") as f:
+            f.write(SWAP_SRC)
+        os.symlink("tests", os.path.join(d, "t"))
+        subprocess.run(
+            [sys.executable, REORDER, "--write", os.path.join(d, "t", "x.py")],
+            check=True,
+        )
+        with open(os.path.join(d, "tests", "x.py")) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a test file was reordered through /…/t/")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tests for reorder-python.py.")
     ap.add_argument("-k", "--filter", default="")
