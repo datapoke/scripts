@@ -750,6 +750,61 @@ def t_checkout_under_tests():
             assert_before(f.read(), "def caller", "def helper")
 
 
+def git_checkout(root: str, *dirs: str) -> str:
+    """A fake repo at `root` (a .git marker) holding SWAP_SRC at each of
+    `dirs`/x.py; returns root."""
+    os.makedirs(os.path.join(root, ".git"))
+    for sub in dirs:
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+        with open(os.path.join(root, sub, "x.py"), "w") as f:
+            f.write(SWAP_SRC)
+    return root
+
+
+@test("in a repo, an absolute path judges only the part below the repo")
+def t_repo_absolute():
+    with tempfile.TemporaryDirectory() as d:
+        proj = git_checkout(os.path.join(d, "tests", "proj"), ".")
+        subprocess.run(
+            [sys.executable, REORDER, "--write", os.path.join(proj, "x.py")],
+            check=True,
+        )
+        with open(os.path.join(proj, "x.py")) as f:
+            assert_before(f.read(), "def caller", "def helper")
+
+
+@test("in a repo, a file under tests/ is skipped from any directory")
+def t_repo_tests_from_inside():
+    with tempfile.TemporaryDirectory() as d:
+        repo = git_checkout(d, "tests")
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "x.py"],
+            cwd=os.path.join(repo, "tests"),
+            check=True,
+        )
+        with open(os.path.join(repo, "tests", "x.py")) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a test file was reordered")
+
+
+@test("absolute paths work from a deleted working directory")
+def t_deleted_cwd():
+    with tempfile.TemporaryDirectory() as d:
+        repo = git_checkout(os.path.join(d, "repo"), ".")
+        gone = os.path.join(d, "gone")
+        os.makedirs(gone)
+        p = subprocess.Popen(
+            ["sh", "-c", 'rmdir "$0" && exec "$@"', gone, sys.executable, REORDER,
+             "--write", os.path.join(repo, "x.py")],
+            cwd=gone, stderr=subprocess.PIPE,
+        )
+        _, err = p.communicate(timeout=10)
+        if p.returncode != 0:
+            raise AssertionError(f"exit {p.returncode}: {err!r}")
+        with open(os.path.join(repo, "x.py")) as f:
+            assert_before(f.read(), "def caller", "def helper")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tests for reorder-python.py.")
     ap.add_argument("-k", "--filter", default="")

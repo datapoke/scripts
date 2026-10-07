@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import io
 import os
 import re
@@ -128,7 +129,7 @@ def main(argv: list[str]) -> int:
         return 1
     failed = False
     for f in files:
-        if is_test_path(f) or is_test_path(os.path.relpath(os.path.realpath(f))):
+        if is_test_code(f):
             continue
         try:
             with open(f, "rb") as fh:
@@ -159,14 +160,44 @@ def main(argv: list[str]) -> int:
     return 1 if failed else 0
 
 
-def is_test_path(f: str) -> bool:
+def is_test_code(f: str) -> bool:
     """Test code is left alone: its methods form no call graph worth
-    ordering, and a double mirrors the order of the class it stands in for."""
-    norm = "/" + f.replace("\\", "/")
-    base = os.path.basename(norm)
+    ordering, and a double mirrors the order of the class it stands in for.
+
+    Inside a git repo the file's real path is judged relative to the repo
+    root, so neither the working directory, a checkout path nor a symlink
+    changes the answer. Outside one, the argument is judged as given, and
+    so is its real path relative to the argument's own directory, which
+    catches a symlink into a tests/ tree.
+    """
+    real = os.path.realpath(f)
+    root = repo_root(os.path.dirname(real))
+    if root is not None:
+        return is_test_path(os.path.relpath(real, root))
+    here = os.path.realpath(os.path.dirname(f) or ".")
+    return is_test_path(f) or is_test_path(os.path.relpath(real, here))
+
+
+@functools.lru_cache(maxsize=None)
+def repo_root(directory: str) -> str | None:
+    """The nearest ancestor of an absolute `directory` holding `.git`."""
+    while True:
+        if os.path.exists(os.path.join(directory, ".git")):
+            return directory
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            return None
+        directory = parent
+
+
+def is_test_path(rel: str) -> bool:
+    """Whether a path names test code by a tests/ or __tests__/ directory,
+    or a test_*.py or *_test.py basename."""
+    parts = rel.replace("\\", "/").split("/")
+    base = parts[-1]
     return (
-        "/tests/" in norm
-        or "/__tests__/" in norm
+        "tests" in parts[:-1]
+        or "__tests__" in parts[:-1]
         or (base.startswith("test_") and base.endswith(".py"))
         or base.endswith("_test.py")
     )
