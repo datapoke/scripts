@@ -694,6 +694,39 @@ def t_unwritable_dir():
             assert_before(f.read(), "def caller", "def helper")
 
 
+@test("mixed line endings and no final newline survive byte for byte")
+def t_mixed_newlines():
+    src = (
+        b"# x\r\n"
+        b"class A:\n"
+        b"    def helper(self):\r\n"
+        b"        return 1\n"
+        b"\n"
+        b"    def caller(self):\n"
+        b"        return self.helper()"
+    )
+    out, rc = run_bytes(src)
+    if rc != 0 or sorted(out) != sorted(src) or out.endswith((b"\n", b"\r")):
+        raise AssertionError(f"exit {rc}: {out!r}")
+    assert_before(out.decode(), "def caller", "def helper")
+
+
+@test("a symlink into tests/ is skipped like the file it names")
+def t_symlink_into_tests():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "tests"))
+        real = os.path.join(d, "tests", "x.py")
+        with open(real, "w") as f:
+            f.write(SWAP_SRC)
+        os.symlink(real, os.path.join(d, "shim.py"))
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "shim.py"], cwd=d, check=True
+        )
+        with open(real) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a test file was reordered through a symlink")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tests for reorder-python.py.")
     ap.add_argument("-k", "--filter", default="")

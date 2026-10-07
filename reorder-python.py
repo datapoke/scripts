@@ -63,6 +63,7 @@ the same and exits 1. `--write` applies.
 from __future__ import annotations
 
 import ast
+import contextlib
 import io
 import os
 import re
@@ -127,7 +128,7 @@ def main(argv: list[str]) -> int:
         return 1
     failed = False
     for f in files:
-        if is_test_path(f):
+        if is_test_path(f) or is_test_path(os.path.realpath(f)):
             continue
         try:
             with open(f, "rb") as fh:
@@ -135,7 +136,7 @@ def main(argv: list[str]) -> int:
             encoding = tokenize.detect_encoding(io.BytesIO(data).readline)[0]
             src = data.decode(encoding)
             out, notes, skipped = reorder(src)
-        except (OSError, SyntaxError, UnicodeDecodeError) as e:
+        except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError) as e:
             print(f"✗ {f}: {e}", file=sys.stderr)
             failed = True
             continue
@@ -179,17 +180,13 @@ def reorder(src: str):
     line numbers of the ones still to come valid. A class already in order,
     or with no run of two methods, is skipped silently.
     """
-    # A last line with no terminator can't move up; lend it one, then take
-    # it back from whatever line ends the file afterwards.
-    lent = "" if not src or src.endswith(("\n", "\r")) else newline_of(src)
-    src += lent
     tree = ast.parse(src)
     lines = split_lines(src)
     deferred = has_future_annotations(tree)
-    headers = header_ends(src)
+    classes = [s for s in tree.body if isinstance(s, ast.ClassDef)]
+    headers = header_ends(src, {c.lineno for c in classes}) if classes else {}
     notes: list[str] = []
     skipped: list[str] = []
-    classes = [s for s in tree.body if isinstance(s, ast.ClassDef)]
     for cls in reversed(classes):
         try:
             result = reorder_class(cls, lines, headers, deferred)
@@ -201,15 +198,7 @@ def reorder(src: str):
         start, end, region, note = result
         lines[start : end + 1] = region
         notes.append(f"{cls.name} reordered: {note}")
-    out = "".join(lines)
-    out = out[: len(out) - len(lent)]
-    return out, list(reversed(notes)), list(reversed(skipped))
-
-
-def newline_of(src: str) -> str:
-    """The file's first line terminator, or \n when it has none."""
-    m = re.search(r"\r\n|\r|\n", src)
-    return m.group() if m else "\n"
+    return "".join(lines), list(reversed(notes)), list(reversed(skipped))
 
 
 def split_lines(src: str) -> list[str]:
@@ -224,24 +213,31 @@ def reorder_class(cls, lines, headers, deferred):
         region_start = body[0].end_lineno  # 0-based line after the docstring
         body = body[1:]
     else:
+        if cls.lineno not in headers:
+            raise LeftAlone("no class header")
         region_start = headers[cls.lineno] + 1
     if len(body) < 2:
         return None
     members = scan_members(body, lines, region_start)
     check_definition_order(members, deferred)
 
-    # Each chunk runs from the end of the member before it, so leading
-    # comments travel; its leading blank lines stay behind as the separator.
+    # @longform Each chunk runs from the end of the member before it, so
+    # leading comments travel. What stays by position: its leading blank
+    # lines, and its last line's terminator, which the file's last may lack.
     seps: list[list[str]] = []
     contents: list[list[str]] = []
+    terms: list[str] = []
     prev = region_start - 1
     for m in members:
         chunk = lines[prev + 1 : m.last + 1]
         k = 0
         while k < len(chunk) and not chunk[k].strip():
             k += 1
+        body = chunk[k:]
+        last = body[-1].rstrip("\r\n")
         seps.append(chunk[:k])
-        contents.append(chunk[k:])
+        terms.append(body[-1][len(last) :])
+        contents.append(body[:-1] + [last])
         prev = m.last
 
     policy = order_methods_node if is_node_class(cls) else order_methods_generic
@@ -254,7 +250,11 @@ def reorder_class(cls, lines, headers, deferred):
         final += [run[k] for k in policy(cls, methods)]
     if final == list(range(len(members))):
         return None
-    region = [line for p, q in enumerate(final) for line in seps[p] + contents[q]]
+    region = [
+        line
+        for p, q in enumerate(final)
+        for line in seps[p] + contents[q][:-1] + [contents[q][-1] + terms[p]]
+    ]
     note = ", ".join(members[p].name or "(field)" for p in final)
     return region_start, members[-1].last, region, note
 
@@ -279,9 +279,9 @@ def is_docstring(stmt: ast.stmt) -> bool:
     )
 
 
-def header_ends(src: str) -> dict[int, int]:
-    """For each `class` keyword's 1-based line, the 0-based line of the `:`
-    that closes its header, from one tokenize pass over the file."""
+def header_ends(src: str, wanted: set[int]) -> dict[int, int]:
+    """For each `class` keyword on a `wanted` 1-based line, the 0-based line
+    of the `:` closing its header: one tokenize pass, stopped at the last."""
     out: dict[int, int] = {}
     start = None
     depth = 0
@@ -296,6 +296,8 @@ def header_ends(src: str) -> dict[int, int]:
             elif tok.string == ":" and depth == 0:
                 out[start] = tok.start[0] - 1
                 start = None
+                if wanted <= out.keys():
+                    break
     return out
 
 
@@ -588,7 +590,8 @@ def write_atomic(path: str, data: bytes) -> bool:
         os.replace(tmp, path)
     except OSError:
         if tmp is not None:
-            os.unlink(tmp)
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
         return False
     return True
 
