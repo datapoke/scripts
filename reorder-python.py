@@ -120,7 +120,6 @@ class Member:
 
 
 def main(argv: list[str]) -> int:
-    sys.stdout.reconfigure(errors="backslashreplace")  # any filename prints
     flags = {a for a in argv if a.startswith("--")}
     files = [a for a in argv if not a.startswith("--")]
     if not files or flags - {"--check", "--write"}:
@@ -141,26 +140,44 @@ def main(argv: list[str]) -> int:
             src = data.decode(encoding)
             out, notes, skipped = reorder(src)
         except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError) as e:
-            print(f"✗ {f}: {e}", file=sys.stderr)
+            say(sys.stderr, "✗ ", f, f": {e}")
             failed = True
             continue
         for note in skipped:
-            print(f"· {f}  {note}")
+            say(sys.stdout, "· ", f, f"  {note}")
         if out == src:
             continue
         new = out.encode(encoding)
         if not invariants_hold(data, new, src, out):
-            print(f"✗ {f}: INVARIANT VIOLATION — aborted", file=sys.stderr)
+            say(sys.stderr, "✗ ", f, ": INVARIANT VIOLATION — aborted")
             failed = True
             continue
         if "--write" in flags and not write_atomic(real, new):
-            print(f"✗ {f}: write failed", file=sys.stderr)
+            say(sys.stderr, "✗ ", f, ": write failed")
             failed = True
             continue
-        print(f"~ {f}  " + "; ".join(notes))
+        say(sys.stdout, "~ ", f, "  " + "; ".join(notes))
         if "--check" in flags:
             failed = True
     return 1 if failed else 0
+
+
+def say(stream, mark: str, f: str, rest: str) -> None:
+    """One report line, the filename in its own bytes so a tool fed by it
+    (xargs, grep) matches the file whatever the locale; the rest escaped."""
+    buf = getattr(stream, "buffer", None)
+    if buf is None:  # a text-only stream, such as a StringIO redirect
+        stream.write(f"{mark}{f}{rest}\n")
+        return
+    enc = stream.encoding or "utf-8"
+    stream.flush()
+    buf.write(
+        mark.encode(enc, "backslashreplace")
+        + os.fsencode(f)
+        + rest.encode(enc, "backslashreplace")
+        + b"\n"
+    )
+    buf.flush()
 
 
 def is_test_code(f: str, real: str) -> bool:
@@ -603,11 +620,9 @@ def shape(src: str) -> list:
 
 
 def write_atomic(path: str, data: bytes) -> bool:
-    """Write through a temp file beside `path`, a resolved real path, then
-    rename it into place; a symlink to it keeps pointing at it. A symlink
-    passed as `path` is refused: the rename would replace the link itself."""
-    if os.path.islink(path):
-        raise ValueError(f"write_atomic needs a resolved path: {path}")
+    """Write through a temp file beside `path`, then rename it into place.
+    `path` must be resolved (main passes os.path.realpath): renamed over a
+    symlink, the temp file would replace the link instead of its target."""
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".reorder")

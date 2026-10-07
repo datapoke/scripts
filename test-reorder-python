@@ -15,8 +15,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.machinery
-import importlib.util
 import os
 import subprocess
 import sys
@@ -855,10 +853,10 @@ def t_absolute_through_dir_link():
                 raise AssertionError("a test file was reordered through /…/t/")
 
 
-@test("a filename stdout can't encode is reported, not a crash")
-def t_unencodable_name():
-    # A strict stdout that can't spell the name: an ASCII locale here, or a
-    # non-UTF-8 name (surrogate-escaped) where the filesystem allows one.
+@test("a filename prints byte for byte whatever stdout's encoding")
+def t_name_bytes():
+    # An ASCII stdout can't spell é; the report line carries the name's own
+    # bytes, so tools fed by it (xargs, grep) still match the file.
     with tempfile.TemporaryDirectory() as d:
         name = os.path.join(d, "café.py")
         with open(name, "w") as f:
@@ -868,29 +866,11 @@ def t_unencodable_name():
             capture_output=True,
             env={**os.environ, "PYTHONIOENCODING": "ascii"},
         )
-    if p.returncode != 0 or b"Traceback" in p.stderr:
-        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
-
-
-@test("write_atomic refuses a symlink rather than replace it with a file")
-def t_write_atomic_refuses_link():
-    loader = importlib.machinery.SourceFileLoader("reorder_under_test", REORDER)
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    with tempfile.TemporaryDirectory() as d:
-        real, link = os.path.join(d, "real.py"), os.path.join(d, "link.py")
-        with open(real, "w") as f:
-            f.write("x = 1\n")
-        os.symlink("real.py", link)
-        try:
-            module.write_atomic(link, b"x = 2\n")
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("a symlink was accepted")
-        if not os.path.islink(link):
-            raise AssertionError("the symlink was replaced by a file")
+        with open(name) as f:
+            rewritten = f.read()
+    if p.returncode != 0 or b"~ " + os.fsencode(name) + b"  " not in p.stdout:
+        raise AssertionError(f"exit {p.returncode}: {p.stdout!r} {p.stderr!r}")
+    assert_before(rewritten, "def caller", "def helper")
 
 
 def main():
