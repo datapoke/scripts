@@ -15,6 +15,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import os
 import subprocess
 import sys
@@ -851,6 +853,44 @@ def t_absolute_through_dir_link():
         with open(os.path.join(d, "tests", "x.py")) as f:
             if f.read() != SWAP_SRC:
                 raise AssertionError("a test file was reordered through /…/t/")
+
+
+@test("a filename stdout can't encode is reported, not a crash")
+def t_unencodable_name():
+    # A strict stdout that can't spell the name: an ASCII locale here, or a
+    # non-UTF-8 name (surrogate-escaped) where the filesystem allows one.
+    with tempfile.TemporaryDirectory() as d:
+        name = os.path.join(d, "café.py")
+        with open(name, "w") as f:
+            f.write(SWAP_SRC)
+        p = subprocess.run(
+            [sys.executable, REORDER, "--write", name],
+            capture_output=True,
+            env={**os.environ, "PYTHONIOENCODING": "ascii"},
+        )
+    if p.returncode != 0 or b"Traceback" in p.stderr:
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+
+
+@test("write_atomic refuses a symlink rather than replace it with a file")
+def t_write_atomic_refuses_link():
+    loader = importlib.machinery.SourceFileLoader("reorder_under_test", REORDER)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    with tempfile.TemporaryDirectory() as d:
+        real, link = os.path.join(d, "real.py"), os.path.join(d, "link.py")
+        with open(real, "w") as f:
+            f.write("x = 1\n")
+        os.symlink("real.py", link)
+        try:
+            module.write_atomic(link, b"x = 2\n")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a symlink was accepted")
+        if not os.path.islink(link):
+            raise AssertionError("the symlink was replaced by a file")
 
 
 def main():

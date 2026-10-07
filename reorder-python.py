@@ -65,6 +65,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import itertools
 import os
 import pathlib
 import re
@@ -119,6 +120,7 @@ class Member:
 
 
 def main(argv: list[str]) -> int:
+    sys.stdout.reconfigure(errors="backslashreplace")  # any filename prints
     flags = {a for a in argv if a.startswith("--")}
     files = [a for a in argv if not a.startswith("--")]
     if not files or flags - {"--check", "--write"}:
@@ -130,7 +132,7 @@ def main(argv: list[str]) -> int:
     failed = False
     for f in files:
         try:
-            real = os.path.realpath(f)  # resolved once: judged, read, written
+            real = os.path.realpath(f)  # the one path read, judged and written
             if is_test_code(f, real):
                 continue
             with open(real, "rb") as fh:
@@ -174,9 +176,7 @@ def is_test_code(f: str, real: str) -> bool:
     """
     if is_test_path(f):
         return True
-    parts = pathlib.PurePath(f).parts
-    for i in range(1, len(parts) + 1):
-        prefix = os.path.join(*parts[:i])
+    for prefix in itertools.accumulate(pathlib.PurePath(f).parts, os.path.join):
         if os.path.islink(prefix):
             base = os.path.realpath(os.path.dirname(prefix) or ".")
             if is_test_path(os.path.relpath(real, base)):
@@ -604,7 +604,10 @@ def shape(src: str) -> list:
 
 def write_atomic(path: str, data: bytes) -> bool:
     """Write through a temp file beside `path`, a resolved real path, then
-    rename it into place; a symlink to it keeps pointing at it."""
+    rename it into place; a symlink to it keeps pointing at it. A symlink
+    passed as `path` is refused: the rename would replace the link itself."""
+    if os.path.islink(path):
+        raise ValueError(f"write_atomic needs a resolved path: {path}")
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".reorder")
