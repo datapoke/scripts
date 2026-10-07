@@ -17,6 +17,7 @@ terminal, and checks for expected behavior. The tests exercise:
       "9mnpm"/"2mnpm" garbage)
     - slot reuse with more items than parallelism
     - nonzero exit code propagation
+    - per-task transcripts: kept and listed on failure, unlinked on success
 
 Usage:
     test-partty            # run all
@@ -27,14 +28,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import os
 import pty
+import resource
 import re
 import select
+import signal
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 
@@ -76,9 +82,11 @@ def run_partty(
     rows: int = 24,
     cols: int = 80,
     timeout: float = 5.0,
+    preexec=None,
 ) -> tuple[bytes, int]:
     """Fork partty under a pty + stdin pipe, capture stdout bytes,
     return (output, exit_status). exit_status is the raw waitpid status.
+    `preexec` runs in the forked child just before exec.
     """
     master_fd, slave_fd = pty.openpty()
     fcntl.ioctl(
@@ -94,6 +102,8 @@ def run_partty(
         os.dup2(slave_fd, 1)
         os.dup2(slave_fd, 2)
         os.close(master_fd)
+        if preexec is not None:
+            preexec()
         os.execvp(PARSPLIT, [PARSPLIT, *args])
     os.close(slave_fd)
     os.close(r)
@@ -867,6 +877,247 @@ def t_nontty_no_partty_labeled():
     assert_contains(out, b"+ echo b")
     if out.count(b"[exit 0]") != 2:
         raise AssertionError(f"expected two [exit 0] blocks; got {out!r}")
+
+
+# ----------------------------------------------------------------------
+# Transcripts: every task's full output goes to a temp file, unlinked when
+# the task exits 0 and listed with its command when it fails.
+# ----------------------------------------------------------------------
+
+# Task `a` prints 60 lines — more than its pane holds — then exits 3; task
+# `b` prints one line and exits 0.
+SPLIT_SCRIPT = (
+    '[ "$1" = a ] || { echo ok-b; exit 0; }\n'
+    "seq 1 60 | sed s/^/line-/\n"
+    "exit 3"
+)
+SPLIT_CMD = ["sh", "-c", SPLIT_SCRIPT, "_"]
+
+
+@contextlib.contextmanager
+def transcript_dir():
+    """Point partty's TMPDIR at a fresh directory and yield it, so a test
+    can count exactly the transcripts one run left behind."""
+    d = tempfile.mkdtemp(prefix="test-partty-")
+    old = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = d
+    try:
+        yield d
+    finally:
+        if old is None:
+            del os.environ["TMPDIR"]
+        else:
+            os.environ["TMPDIR"] = old
+        shutil.rmtree(d)
+
+
+def transcripts(d: str) -> list[str]:
+    return sorted(os.path.join(d, f) for f in os.listdir(d))
+
+
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def assert_one_transcript(d: str, newline: bytes) -> str:
+    """The failing task's transcript is the only file left, and it holds
+    the task's whole output — including lines its pane scrolled away."""
+    files = transcripts(d)
+    if len(files) != 1:
+        raise AssertionError(f"expected one transcript, found {files}")
+    body = read_bytes(files[0])
+    assert_contains(body, b"line-1" + newline, "first line kept")
+    assert_contains(body, b"line-60" + newline, "last line kept")
+    assert_not_contains(body, b"ok-b", "passing task's output")
+    return files[0]
+
+
+@test("pane UI keeps a failed task's full transcript and lists it")
+def t_transcript_pane_failure():
+    with transcript_dir() as d:
+        out, status = run_paned(SPLIT_CMD)
+        path = assert_one_transcript(d, b"\r\n")
+    plain = strip_ansi(out)
+    assert_contains(plain, b"partty: 1 of 2 tasks failed")
+    assert_contains(plain, b"[exit 3] sh -c")
+    assert_contains(plain, path.encode())
+    if os.waitstatus_to_exitcode(status) != 3:
+        raise AssertionError(f"expected exit 3, got status {status}")
+
+
+@test("pane UI unlinks every transcript when all tasks pass")
+def t_transcript_pane_success():
+    with transcript_dir() as d:
+        out, _ = run_paned(["sh", "-c", "echo fine", "_"])
+        left = transcripts(d)
+    if left:
+        raise AssertionError(f"transcripts left behind: {left}")
+    assert_not_contains(strip_ansi(out), b"failed")
+
+
+@test("pane UI keeps the transcript of a command that cannot exec")
+def t_transcript_pane_exec_failure():
+    with transcript_dir() as d:
+        out, _ = run_paned(["/nonexistent/partty-cmd"])
+        files = transcripts(d)
+        if len(files) != 2:
+            raise AssertionError(f"expected two transcripts, found {files}")
+        for f in files:
+            body = read_bytes(f)
+            assert_contains(body, b"partty: failed to exec")
+            assert_not_contains(body, b"\r", "same bytes as the non-tty runner")
+    assert_contains(strip_ansi(out), b"partty: 2 of 2 tasks failed")
+
+
+@test("non-tty keeps a failed task's transcript and lists it on stderr")
+def t_transcript_plain_failure():
+    with transcript_dir() as d:
+        p = subprocess.run(
+            [PARSPLIT, "-P2", *SPLIT_CMD], input=PANED_STDIN, capture_output=True
+        )
+        path = assert_one_transcript(d, b"\n")
+    assert_contains(p.stderr, b"partty: 1 of 2 tasks failed")
+    assert_contains(p.stderr, b"[exit 3] sh -c")
+    assert_contains(p.stderr, path.encode())
+    assert_not_contains(p.stdout, b"tasks failed", "stdout keeps its format")
+    assert_contains(p.stdout, b"line-1\n")
+    if p.returncode != 3:
+        raise AssertionError(f"expected exit 3, got {p.returncode}")
+
+
+@test("pass-through lists failed tasks without transcripts")
+def t_transcript_passthrough_failure():
+    with transcript_dir() as d:
+        out, _ = run_partty(["-P1", *SPLIT_CMD], PANED_STDIN)
+        left = transcripts(d)
+    if left:
+        raise AssertionError(f"pass-through wrote transcripts: {left}")
+    assert_contains(out, b"partty: 1 of 2 tasks failed")
+    assert_contains(out, b"[exit 3] sh -c")
+
+
+def exit_code(status: int) -> int:
+    return os.waitstatus_to_exitcode(status)
+
+
+def failure_report(out: bytes) -> bytes:
+    """The part of partty's output from the failure list onward."""
+    plain = strip_ansi(out)
+    at = plain.find(b"tasks failed")
+    if at < 0:
+        raise AssertionError("no failure list")
+    return plain[at:]
+
+
+@test("a full transcript disk doesn't stall the task")
+def t_transcript_write_error():
+    # RLIMIT_FSIZE turns transcript writes into EFBIG (Python ignores
+    # SIGXFSZ). The task writes more than a pty buffer holds, so a reader
+    # that stopped draining would block it forever.
+    def limit():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (64, 64))
+
+    with transcript_dir():
+        out, status = run_gated_pane(
+            "head -c 65536 /dev/zero | tr '\\0' x; exit 3", preexec=limit
+        )
+    if exit_code(status) != 3:
+        raise AssertionError(f"expected exit 3, got status {status}")
+    assert_contains(failure_report(out), b"(incomplete: ")
+
+
+@test("a signal-killed task exits 128+signal in the pane UI")
+def t_transcript_signal_pane():
+    with transcript_dir():
+        out, status = run_gated_pane("kill -9 $$")
+    if exit_code(status) != 137:
+        raise AssertionError(f"expected exit 137, got {exit_code(status)}")
+    assert_contains(failure_report(out), b"[exit 137] sh -c")
+
+
+@test("a signal-killed task exits 128+signal off a tty")
+def t_transcript_signal_plain():
+    with transcript_dir():
+        p = subprocess.run(
+            [PARSPLIT, "-P2", "sh", "-c", '[ "$1" = a ] || exit 0; kill -9 $$', "_"],
+            input=PANED_STDIN,
+            capture_output=True,
+        )
+    if p.returncode != 137:
+        raise AssertionError(f"expected exit 137, got {p.returncode}")
+    assert_contains(p.stderr, b"[exit 137] sh -c")
+
+
+@test("failed tasks are listed in input order, not finish order")
+def t_transcript_order():
+    with transcript_dir():
+        out, _ = run_paned(
+            ["sh", "-c", '[ "$1" = a ] && sleep 0.5; exit 1', "_"]
+        )
+    report = failure_report(out)
+    a, b = report.find(b"_ a\r"), report.find(b"_ b\r")
+    if not 0 <= a < b:
+        raise AssertionError(f"expected a before b in {report!r}")
+
+
+@test("a reused pane's earlier task keeps its late output")
+def t_transcript_late_output():
+    # Task a fails at once but leaves a grandchild holding its pty that
+    # writes later; task c then takes over a's pane and finishes first.
+    script = (
+        'case "$1" in a) (sleep 0.3; echo late-a) & exit 1;;'
+        " b) sleep 0.1;; esac"
+    )
+    with transcript_dir() as d:
+        run_partty(["-P2", "sh", "-c", script, "_"], b"a\nb\nc\n")
+        files = transcripts(d)
+        if len(files) != 1:
+            raise AssertionError(f"expected one transcript, found {files}")
+        assert_contains(read_bytes(files[0]), b"late-a")
+
+
+@test("a transcript deleted mid-run doesn't crash partty")
+def t_transcript_deleted():
+    script = '[ "$1" = a ] && rm -f "$TMPDIR"/partty-*.log; sleep 0.2'
+    with transcript_dir():
+        out, status = run_paned(["sh", "-c", script, "_"])
+    if exit_code(status) != 0:
+        raise AssertionError(f"expected exit 0, got {exit_code(status)}")
+    assert_not_contains(out, b"Traceback")
+
+
+@test("Ctrl-C off a tty lists the interrupted tasks' transcripts")
+def t_transcript_plain_interrupt():
+    r, w = os.pipe()
+    os.write(w, PANED_STDIN)
+    os.close(w)
+    with transcript_dir() as d:
+        p = subprocess.Popen(
+            [PARSPLIT, "-P2", "sh", "-c", "echo started-$1; sleep 10", "_"],
+            stdin=r,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        os.close(r)
+        time.sleep(0.5)
+        os.killpg(p.pid, signal.SIGINT)
+        try:
+            _, err = p.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            raise AssertionError("partty didn't exit after SIGINT")
+        files = transcripts(d)
+        if len(files) != 2:
+            raise AssertionError(f"expected two transcripts, found {files}")
+        for f in files:
+            assert_contains(err, f.encode())
+            assert_contains(read_bytes(f), b"started-")
+    assert_not_contains(err, b"Traceback")
+    assert_contains(err, b"partty: 2 of 2 tasks failed")
+    if p.returncode != 130:
+        raise AssertionError(f"expected exit 130, got {p.returncode}")
 
 
 # ----------------------------------------------------------------------
