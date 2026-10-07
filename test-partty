@@ -1361,6 +1361,18 @@ def load_partty():
 
 
 @contextlib.contextmanager
+def seam(owner, name: str, value):
+    """Set `owner.name` for the block, restoring it however the block ends;
+    partty loads once, so a patch left behind would reach every later test."""
+    real = vars(owner)[name]  # raw, so a staticmethod comes back wrapped
+    setattr(owner, name, value)
+    try:
+        yield
+    finally:
+        setattr(owner, name, real)
+
+
+@contextlib.contextmanager
 def without_waitid():
     """Hide os.waitid, as macOS's Python before 3.13 does."""
     saved = getattr(os, "waitid", None)
@@ -1389,9 +1401,12 @@ def t_kqueue_exit():
                 raise AssertionError("the exit check reaped the child")
             if not child.exited():
                 raise AssertionError("a seen exit was forgotten")
+            if child.wait() != 0:
+                raise AssertionError(f"reaped with {child.returncode}, not 0")
         finally:
-            child.kill()
-            child.wait()
+            if child.returncode is None:
+                child.kill()
+                child.wait()
 
 
 @test("kqueue registration error raises, then a retry still works")
@@ -1414,17 +1429,14 @@ def t_kqueue_error():
 
     with without_waitid():
         child = pt.Child(["sleep", "0.3"], stdin=subprocess.DEVNULL)
-        real = pt.Child.kqueue
         try:
-            pt.Child.kqueue = lambda: Refusing()  # any zero-argument callable
-            try:
-                child.exited()
-            except PermissionError:
-                pass
-            else:
-                raise AssertionError("an EPERM registration read as an exit")
-            finally:
-                pt.Child.kqueue = real
+            with seam(pt.Child, "kqueue", staticmethod(Refusing)):
+                try:
+                    child.exited()
+                except PermissionError:
+                    pass
+                else:
+                    raise AssertionError("an EPERM registration read as an exit")
             if child.exited():
                 raise AssertionError("a retry after the error read as exited")
             if not child.exited(block=True):
@@ -1449,17 +1461,15 @@ def t_kqueue_register_raises():
 
     with without_waitid():
         child = pt.Child(["true"], stdin=subprocess.DEVNULL)
-        real = pt.Child.kqueue
         try:
-            time.sleep(0.2)  # let it exit; it stays unreaped
-            pt.Child.kqueue = lambda: Broken()
-            try:
-                child.exited()
-            except OSError:
-                pass
-            finally:
-                pt.Child.kqueue = real
-            if not child.exited():
+            with seam(pt.Child, "kqueue", staticmethod(Broken)):
+                try:
+                    child.exited()
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("the broken queue was never asked")
+            if not child.exited(block=True):
                 raise AssertionError("the failed queue was kept, not replaced")
         finally:
             child.wait()

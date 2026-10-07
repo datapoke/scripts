@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import concurrent.futures
 import errno
 import fcntl
@@ -892,9 +893,11 @@ def reader(
             screen.feed(text)
         if text:
             redraw_event.set()
+    final = ""
     with slot.lock:
-        final = decoder.decode(b"", final=True) if slot.screen is screen else ""
-        screen.feed(final)
+        if slot.screen is screen:
+            final = decoder.decode(b"", final=True)
+            screen.feed(final)
     if final:
         redraw_event.set()
     transcript.close()
@@ -1107,14 +1110,13 @@ class Child(subprocess.Popen):
     pid, and so its process group id, can't be reused while
     `signal_to_group` may aim at it.
 
-    `Child.kqueue` is a test seam: the factory the os.waitid-less path
-    calls, through the class, to open its queue (select.kqueue). Tests
-    assign a fake to drive its error paths. Signature: a zero-argument
-    callable returning an object with `control(changes, n, timeout)` and
-    `close()`.
+    `kqueue` is a test seam: the factory the os.waitid-less path calls to
+    open its queue (select.kqueue). Tests assign `staticmethod(fake)` to
+    drive its error paths. Signature: `() -> object` with
+    `control(changes, n, timeout)` and `close()`.
     """
 
-    kqueue = select.kqueue if hasattr(select, "kqueue") else None
+    kqueue = staticmethod(select.kqueue) if hasattr(select, "kqueue") else None
     _seen_exit = False
     _kq = None
 
@@ -1135,7 +1137,7 @@ class Child(subprocess.Popen):
         kqueue, registered on first ask and closed once it answers."""
         changes = None
         if self._kq is None:
-            self._kq = Child.kqueue()
+            self._kq = self.kqueue()
             flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
             changes = [
                 select.kevent(
@@ -1145,7 +1147,9 @@ class Child(subprocess.Popen):
         try:
             events = self._kq.control(changes, 1, None if block else 0)
         except BaseException:
-            self._drop_kq()  # unregistered or broken: the next ask starts over
+            # Unregistered or broken: the next ask starts over.
+            with contextlib.suppress(OSError):
+                self._drop_kq()
             raise
         if not events:
             return False
