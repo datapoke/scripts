@@ -842,7 +842,7 @@ class Slot:
         self.rc: int | None = None
         self.lock = threading.Lock()
         self.master_fd: int = -1
-        self.proc: subprocess.Popen | None = None
+        self.proc: Child | None = None
         self.thread: threading.Thread | None = None
         self.has_run = False
         self.task_index = -1
@@ -894,7 +894,7 @@ def reader(
             screen.feed(text)
         redraw_event.set()
     final = decoder.decode(b"", final=True)
-    if final:
+    if final and slot.screen is screen:
         with slot.lock:
             screen.feed(final)
         redraw_event.set()
@@ -1103,49 +1103,56 @@ def report_failures(results: Results) -> int:
     return aggregate_rc([rc for _, rc, _ in finished])
 
 
-# Per child: True once its exit is seen, or its kqueue while it runs.
-_exits: dict[subprocess.Popen, object] = {}
+class Child(subprocess.Popen):
+    """A Popen that can tell it has exited without reaping itself, so its
+    pid, and so its process group id, can't be reused while
+    `signal_to_group` may aim at it."""
 
+    # kqueue factory seam: what the os.waitid-less path calls to open its
+    # queue. Tests replace it with a fake whose control() returns an error
+    # event. Signature: `() -> object with control(changes, n, timeout)
+    # and close()`.
+    kqueue = select.kqueue if hasattr(select, "kqueue") else None
+    _seen_exit = False
+    _kq = None
 
-def exited(proc: subprocess.Popen, block: bool = False) -> bool:
-    """Whether the child has exited, leaving it unreaped so its pid, and so
-    its process group id, can't be reused while `signal_to_group` may aim at
-    it; `block` waits for the exit. `Forwarder.reap` forgets the child."""
-    if proc.returncode is not None or _exits.get(proc) is True:
+    def exited(self, block: bool = False) -> bool:
+        """Whether the child has exited, leaving it unreaped; `block` waits
+        for the exit."""
+        if self.returncode is not None or self._seen_exit:
+            return True
+        if hasattr(os, "waitid"):
+            flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
+            self._seen_exit = os.waitid(os.P_PID, self.pid, flags) is not None
+        else:
+            self._seen_exit = self._kqueue_exited(block)
+        return self._seen_exit
+
+    def _kqueue_exited(self, block: bool) -> bool:
+        """`exited` for macOS Pythons before 3.13, which lack os.waitid: one
+        kqueue, registered on first ask and closed once it answers."""
+        changes = None
+        if self._kq is None:
+            self._kq = self.kqueue()
+            flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
+            changes = [
+                select.kevent(
+                    self.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT
+                )
+            ]
+        events = self._kq.control(changes, 1, None if block else 0)
+        if not events:
+            return False
+        kq, self._kq = self._kq, None
+        kq.close()
+        ev = events[0]
+        # A zombie refuses registration with ESRCH: it has exited.
+        if ev.flags & select.KQ_EV_ERROR and ev.data != errno.ESRCH:
+            raise OSError(ev.data, os.strerror(ev.data))
         return True
-    if hasattr(os, "waitid"):
-        flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
-        done = os.waitid(os.P_PID, proc.pid, flags) is not None
-    else:
-        done = kqueue_exited(proc, block)
-    if done:
-        _exits[proc] = True
-    return done
 
 
-def kqueue_exited(proc: subprocess.Popen, block: bool) -> bool:
-    """`exited` for macOS Pythons before 3.13, which lack os.waitid: one
-    kqueue per child, registered on first ask and closed at its exit."""
-    kq = _exits.get(proc)
-    changes = None
-    if kq is None:
-        kq = _exits[proc] = select.kqueue()
-        flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
-        changes = [
-            select.kevent(proc.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT)
-        ]
-    events = kq.control(changes, 1, None if block else 0)
-    if not events:
-        return False
-    kq.close()
-    ev = events[0]
-    # A zombie refuses registration with ESRCH: it has exited.
-    if ev.flags & select.KQ_EV_ERROR and ev.data != errno.ESRCH:
-        raise OSError(ev.data, os.strerror(ev.data))
-    return True
-
-
-def signal_to_group(proc: subprocess.Popen, sig: int) -> None:
+def signal_to_group(proc: Child, sig: int) -> None:
     """Send `sig` to the child's whole process group (it was started with
     start_new_session, so its pid is its group id), reaching pipeline members
     and background processes even after the leader has exited. The caller
@@ -1167,7 +1174,7 @@ class Forwarder:
     def __init__(self) -> None:
         self.caught: int | None = None
         self._escalated = False
-        self._procs: set[subprocess.Popen] = set()
+        self._procs: set[Child] = set()
 
     def __enter__(self) -> "Forwarder":
         self._prev = {
@@ -1182,10 +1189,8 @@ class Forwarder:
         for proc in list(self._procs):
             signal_to_group(proc, self._signal())
 
-    def popen(self, argv: list[str], **kw) -> subprocess.Popen:
-        proc = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, start_new_session=True, **kw
-        )
+    def popen(self, argv: list[str], **kw) -> Child:
+        proc = Child(argv, stdin=subprocess.DEVNULL, start_new_session=True, **kw)
         self._procs.add(proc)
         if self.caught is not None:
             signal_to_group(proc, self._signal())  # it landed during Popen
@@ -1198,13 +1203,12 @@ class Forwarder:
         for s, handler in self._prev.items():
             signal.signal(s, handler)
 
-    def reap(self, proc: subprocess.Popen) -> int:
+    def reap(self, proc: Child) -> int:
         """Wait for the child to exit, stop forwarding to it, then reap it;
         in that order, no signal can reach a pid freed for reuse."""
-        exited(proc, block=True)
+        proc.exited(block=True)
         self._procs.discard(proc)
         proc.wait()
-        _exits.pop(proc, None)
         return exit_status(proc.returncode)
 
 
@@ -1239,14 +1243,14 @@ def run_passthrough(invocations: list[list[str]]) -> int:
     return rc if fwd.caught is None else 128 + fwd.caught
 
 
-def drain(proc: subprocess.Popen, transcript: Transcript) -> bytearray:
+def drain(proc: Child, transcript: Transcript) -> bytearray:
     """Read the task's stdout into memory and its transcript until EOF, or
     until READER_GRACE_S after the task exits, then close the pipe."""
     data = bytearray()
     fd = proc.stdout.fileno()
     deadline = None
     while True:
-        if deadline is None and exited(proc):
+        if deadline is None and proc.exited():
             deadline = time.monotonic() + READER_GRACE_S
         timeout = 0.1 if deadline is None else deadline - time.monotonic()
         if timeout <= 0:
@@ -1609,7 +1613,7 @@ def main():
                 for slot in slots:
                     if slot.proc is None:
                         continue
-                    if not slot.done and exited(slot.proc):
+                    if not slot.done and slot.proc.exited():
                         rc = fwd.reap(slot.proc)
                         if slot.thread is not None:
                             slot.thread.join(timeout=0.1)

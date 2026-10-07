@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
+import importlib.machinery
+import importlib.util
 import os
 import pty
 import re
@@ -42,6 +45,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 
 # ----------------------------------------------------------------------
@@ -1335,6 +1339,116 @@ def t_transcript_exec_drawn():
     plain = strip_ansi(out)
     for item in (b"a", b"b", b"c", b"d"):
         assert_contains(plain, b"partty-cmd " + item + b"  [exit 127]")
+
+
+# ----------------------------------------------------------------------
+# In-process: partty loaded as a module, for paths no subprocess reaches.
+# ----------------------------------------------------------------------
+
+
+def load_partty():
+    path = shutil.which(PARSPLIT) or PARSPLIT
+    loader = importlib.machinery.SourceFileLoader("partty_under_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@contextlib.contextmanager
+def without_waitid():
+    """Hide os.waitid, as macOS's Python before 3.13 does."""
+    saved = getattr(os, "waitid", None)
+    if saved is not None:
+        del os.waitid
+    try:
+        yield
+    finally:
+        if saved is not None:
+            os.waitid = saved
+
+
+@test("kqueue exit detection: running, exited unreaped, then reaped")
+def t_kqueue_exit():
+    if not hasattr(select, "kqueue"):
+        return
+    pt = load_partty()
+    with without_waitid():
+        child = pt.Child(["sleep", "0.2"], stdin=subprocess.DEVNULL)
+        if child.exited():
+            raise AssertionError("a running child read as exited")
+        if not child.exited(block=True):
+            raise AssertionError("a blocking ask returned before the exit")
+        if child.returncode is not None:
+            raise AssertionError("the exit check reaped the child")
+        if not child.exited() or child.wait() != 0:
+            raise AssertionError("a seen exit was forgotten")
+
+
+@test("kqueue registration error raises, then a retry still works")
+def t_kqueue_error():
+    if not hasattr(select, "kqueue"):
+        return
+    pt = load_partty()
+
+    class Refusing:
+        def control(self, changes, n, timeout):
+            return [
+                select.kevent(
+                    child.pid, select.KQ_FILTER_PROC, flags=select.KQ_EV_ERROR,
+                    data=errno.EPERM,
+                )
+            ]
+
+        def close(self):
+            pass
+
+    with without_waitid():
+        child = pt.Child(["sleep", "0.3"], stdin=subprocess.DEVNULL)
+        real, pt.Child.kqueue = pt.Child.kqueue, Refusing
+        try:
+            child.exited()
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("an EPERM registration read as an exit")
+        finally:
+            pt.Child.kqueue = real
+        if child.exited():
+            raise AssertionError("a retry after the error read as exited")
+        if not child.exited(block=True):
+            raise AssertionError("a retry after the error never saw the exit")
+        child.wait()
+
+
+@test("a reader whose pane moved on feeds only the transcript")
+def t_reader_detached():
+    # A partial UTF-8 sequence arrives while the pane is live; the pane then
+    # takes the next task; EOF flushes the sequence as U+FFFD, and that
+    # flush must not reach the abandoned screen or ask for a redraw.
+    pt = load_partty()
+    with transcript_dir():
+        slot = pt.Slot(3, 20)
+        old = slot.screen
+        transcript = pt.Transcript()
+        redraw = threading.Event()
+        r, w = os.pipe()
+        t = threading.Thread(target=pt.reader, args=(slot, r, old, transcript, redraw))
+        t.start()
+        os.write(w, b"x\xe2\x82")
+        if not redraw.wait(2):
+            raise AssertionError("the live pane was never fed")
+        slot.screen = pt.VirtualPane(3, 20)
+        redraw.clear()
+        before = old.render_lines()
+        os.write(w, b"late")
+        os.close(w)
+        t.join(2)
+        kept = read_bytes(transcript.path)
+    if old.render_lines() != before or redraw.is_set():
+        raise AssertionError("the abandoned screen was fed or redrawn")
+    if kept != b"x\xe2\x82late":
+        raise AssertionError(f"transcript holds {kept!r}")
 
 
 # ----------------------------------------------------------------------
