@@ -31,6 +31,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import functools
 import importlib.machinery
 import importlib.util
 import os
@@ -903,8 +904,8 @@ def transcript_dir():
     """Point partty's TMPDIR at a fresh directory and yield it, so a test
     can count exactly the transcripts one run left behind."""
     d = tempfile.mkdtemp(prefix="test-partty-")
-    old = os.environ.get("TMPDIR")
-    os.environ["TMPDIR"] = d
+    old, old_cached = os.environ.get("TMPDIR"), tempfile.tempdir
+    os.environ["TMPDIR"] = tempfile.tempdir = d  # tempfile caches its dir
     try:
         yield d
     finally:
@@ -912,6 +913,7 @@ def transcript_dir():
             del os.environ["TMPDIR"]
         else:
             os.environ["TMPDIR"] = old
+        tempfile.tempdir = old_cached
         shutil.rmtree(d)
 
 
@@ -1346,7 +1348,10 @@ def t_transcript_exec_drawn():
 # ----------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def load_partty():
+    """partty as a module: the same file PARSPLIT names for the subprocess
+    tests, loaded once."""
     path = shutil.which(PARSPLIT) or PARSPLIT
     loader = importlib.machinery.SourceFileLoader("partty_under_test", path)
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -1375,14 +1380,18 @@ def t_kqueue_exit():
     pt = load_partty()
     with without_waitid():
         child = pt.Child(["sleep", "0.2"], stdin=subprocess.DEVNULL)
-        if child.exited():
-            raise AssertionError("a running child read as exited")
-        if not child.exited(block=True):
-            raise AssertionError("a blocking ask returned before the exit")
-        if child.returncode is not None:
-            raise AssertionError("the exit check reaped the child")
-        if not child.exited() or child.wait() != 0:
-            raise AssertionError("a seen exit was forgotten")
+        try:
+            if child.exited():
+                raise AssertionError("a running child read as exited")
+            if not child.exited(block=True):
+                raise AssertionError("a blocking ask returned before the exit")
+            if child.returncode is not None:
+                raise AssertionError("the exit check reaped the child")
+            if not child.exited():
+                raise AssertionError("a seen exit was forgotten")
+        finally:
+            child.kill()
+            child.wait()
 
 
 @test("kqueue registration error raises, then a retry still works")
@@ -1405,20 +1414,55 @@ def t_kqueue_error():
 
     with without_waitid():
         child = pt.Child(["sleep", "0.3"], stdin=subprocess.DEVNULL)
-        real, pt.Child.kqueue = pt.Child.kqueue, Refusing
+        real = pt.Child.kqueue
         try:
-            child.exited()
-        except PermissionError:
-            pass
-        else:
-            raise AssertionError("an EPERM registration read as an exit")
+            pt.Child.kqueue = lambda: Refusing()  # any zero-argument callable
+            try:
+                child.exited()
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("an EPERM registration read as an exit")
+            finally:
+                pt.Child.kqueue = real
+            if child.exited():
+                raise AssertionError("a retry after the error read as exited")
+            if not child.exited(block=True):
+                raise AssertionError("a retry after the error never saw the exit")
         finally:
-            pt.Child.kqueue = real
-        if child.exited():
-            raise AssertionError("a retry after the error read as exited")
-        if not child.exited(block=True):
-            raise AssertionError("a retry after the error never saw the exit")
-        child.wait()
+            child.kill()
+            child.wait()
+
+
+@test("a kqueue that fails to register is dropped, not waited on")
+def t_kqueue_register_raises():
+    if not hasattr(select, "kqueue"):
+        return
+    pt = load_partty()
+
+    class Broken:
+        def control(self, changes, n, timeout):
+            raise OSError(errno.ENOMEM, "no memory")
+
+        def close(self):
+            pass
+
+    with without_waitid():
+        child = pt.Child(["true"], stdin=subprocess.DEVNULL)
+        real = pt.Child.kqueue
+        try:
+            time.sleep(0.2)  # let it exit; it stays unreaped
+            pt.Child.kqueue = lambda: Broken()
+            try:
+                child.exited()
+            except OSError:
+                pass
+            finally:
+                pt.Child.kqueue = real
+            if not child.exited():
+                raise AssertionError("the failed queue was kept, not replaced")
+        finally:
+            child.wait()
 
 
 @test("a reader whose pane moved on feeds only the transcript")
@@ -1427,7 +1471,7 @@ def t_reader_detached():
     # takes the next task; EOF flushes the sequence as U+FFFD, and that
     # flush must not reach the abandoned screen or ask for a redraw.
     pt = load_partty()
-    with transcript_dir():
+    with transcript_dir() as d:
         slot = pt.Slot(3, 20)
         old = slot.screen
         transcript = pt.Transcript()
@@ -1445,6 +1489,8 @@ def t_reader_detached():
         os.close(w)
         t.join(2)
         kept = read_bytes(transcript.path)
+        if not transcript.path.startswith(d):
+            raise AssertionError("the transcript escaped the test's TMPDIR")
     if old.render_lines() != before or redraw.is_set():
         raise AssertionError("the abandoned screen was fed or redrawn")
     if kept != b"x\xe2\x82late":

@@ -885,18 +885,17 @@ def reader(
         if not chunk:
             break
         transcript.write(chunk)
-        if slot.screen is not screen:
-            continue  # the pane has moved on; nobody draws this screen
-        text = decoder.decode(chunk)
-        if not text:
-            continue
         with slot.lock:
+            if slot.screen is not screen:
+                continue  # the pane has moved on; nobody draws this screen
+            text = decoder.decode(chunk)
             screen.feed(text)
-        redraw_event.set()
-    final = decoder.decode(b"", final=True)
-    if final and slot.screen is screen:
-        with slot.lock:
-            screen.feed(final)
+        if text:
+            redraw_event.set()
+    with slot.lock:
+        final = decoder.decode(b"", final=True) if slot.screen is screen else ""
+        screen.feed(final)
+    if final:
         redraw_event.set()
     transcript.close()
     with slot.lock:
@@ -1106,12 +1105,15 @@ def report_failures(results: Results) -> int:
 class Child(subprocess.Popen):
     """A Popen that can tell it has exited without reaping itself, so its
     pid, and so its process group id, can't be reused while
-    `signal_to_group` may aim at it."""
+    `signal_to_group` may aim at it.
 
-    # kqueue factory seam: what the os.waitid-less path calls to open its
-    # queue. Tests replace it with a fake whose control() returns an error
-    # event. Signature: `() -> object with control(changes, n, timeout)
-    # and close()`.
+    `Child.kqueue` is a test seam: the factory the os.waitid-less path
+    calls, through the class, to open its queue (select.kqueue). Tests
+    assign a fake to drive its error paths. Signature: a zero-argument
+    callable returning an object with `control(changes, n, timeout)` and
+    `close()`.
+    """
+
     kqueue = select.kqueue if hasattr(select, "kqueue") else None
     _seen_exit = False
     _kq = None
@@ -1133,23 +1135,30 @@ class Child(subprocess.Popen):
         kqueue, registered on first ask and closed once it answers."""
         changes = None
         if self._kq is None:
-            self._kq = self.kqueue()
+            self._kq = Child.kqueue()
             flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
             changes = [
                 select.kevent(
                     self.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT
                 )
             ]
-        events = self._kq.control(changes, 1, None if block else 0)
+        try:
+            events = self._kq.control(changes, 1, None if block else 0)
+        except BaseException:
+            self._drop_kq()  # unregistered or broken: the next ask starts over
+            raise
         if not events:
             return False
-        kq, self._kq = self._kq, None
-        kq.close()
+        self._drop_kq()
         ev = events[0]
         # A zombie refuses registration with ESRCH: it has exited.
         if ev.flags & select.KQ_EV_ERROR and ev.data != errno.ESRCH:
             raise OSError(ev.data, os.strerror(ev.data))
         return True
+
+    def _drop_kq(self) -> None:
+        kq, self._kq = self._kq, None
+        kq.close()
 
 
 def signal_to_group(proc: Child, sig: int) -> None:
