@@ -239,54 +239,6 @@ class SGRState:
         self.fg: tuple | None = None
         self.bg: tuple | None = None
 
-    def reset(self) -> None:
-        self.bold = self.dim = self.italic = self.underline = False
-        self.blink = self.reverse = self.hidden = self.strike = False
-        self.fg = None
-        self.bg = None
-
-    def clone(self) -> "SGRState":
-        new = SGRState.__new__(SGRState)
-        new.bold = self.bold
-        new.dim = self.dim
-        new.italic = self.italic
-        new.underline = self.underline
-        new.blink = self.blink
-        new.reverse = self.reverse
-        new.hidden = self.hidden
-        new.strike = self.strike
-        new.fg = self.fg
-        new.bg = self.bg
-        return new
-
-    def key(self) -> tuple:
-        return (
-            self.bold,
-            self.dim,
-            self.italic,
-            self.underline,
-            self.blink,
-            self.reverse,
-            self.hidden,
-            self.strike,
-            self.fg,
-            self.bg,
-        )
-
-    def is_default(self) -> bool:
-        return self.key() == (
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            False,
-            None,
-            None,
-        )
-
     def apply(self, params: list[int]) -> None:
         # Empty `\x1b[m` resets.
         if not params:
@@ -378,6 +330,12 @@ class SGRState:
             # else: ignore unknown attributes (underline color, font, etc.)
             i += 1
 
+    def reset(self) -> None:
+        self.bold = self.dim = self.italic = self.underline = False
+        self.blink = self.reverse = self.hidden = self.strike = False
+        self.fg = None
+        self.bg = None
+
     def to_sgr(self) -> str:
         """Emit a canonical SGR sequence representing this state. Empty when
         the state is default — callers should treat empty as 'no markup'.
@@ -420,6 +378,48 @@ class SGRState:
             elif kind == "rgb":
                 parts.extend([48, 2, self.bg[1], self.bg[2], self.bg[3]])
         return "\x1b[" + ";".join(str(p) for p in parts) + "m"
+
+    def is_default(self) -> bool:
+        return self.key() == (
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            None,
+        )
+
+    def key(self) -> tuple:
+        return (
+            self.bold,
+            self.dim,
+            self.italic,
+            self.underline,
+            self.blink,
+            self.reverse,
+            self.hidden,
+            self.strike,
+            self.fg,
+            self.bg,
+        )
+
+    def clone(self) -> "SGRState":
+        new = SGRState.__new__(SGRState)
+        new.bold = self.bold
+        new.dim = self.dim
+        new.italic = self.italic
+        new.underline = self.underline
+        new.blink = self.blink
+        new.reverse = self.reverse
+        new.hidden = self.hidden
+        new.strike = self.strike
+        new.fg = self.fg
+        new.bg = self.bg
+        return new
 
 
 class VirtualPane:
@@ -488,29 +488,6 @@ class VirtualPane:
         self._saved_sgr = SGRState()
         self._state = "ground"
         self._buf = ""
-
-    def _blank_row(self) -> list[tuple[str, str]]:
-        return [(" ", "")] * self.cols
-
-    def resize(self, rows: int, cols: int) -> None:
-        rows = max(1, rows)
-        cols = max(1, cols)
-        # Keep the bottom-right slice (most recent content + leftmost cols).
-        new_grid = [[(" ", "")] * cols for _ in range(rows)]
-        copy_rows = min(rows, self.rows)
-        copy_cols = min(cols, self.cols)
-        for i in range(copy_rows):
-            old_r = self.rows - copy_rows + i
-            new_r = rows - copy_rows + i
-            for c in range(copy_cols):
-                new_grid[new_r][c] = self.grid[old_r][c]
-        self.grid = new_grid
-        self.rows = rows
-        self.cols = cols
-        self.cursor_row = min(self.cursor_row, rows - 1)
-        self.cursor_col = min(self.cursor_col, cols - 1)
-        self.saved_row = min(self.saved_row, rows - 1)
-        self.saved_col = min(self.saved_col, cols - 1)
 
     def feed(self, text: str) -> None:
         for ch in text:
@@ -609,61 +586,6 @@ class VirtualPane:
                 self._state = "ground"
             else:
                 self._state = "eat_st"
-
-    def _put_char(self, ch: str) -> None:
-        w = cell_width(ch)
-        if w == 0:
-            # Combining marks / zero-width joiners — attach to the previous
-            # cell so emoji + skin-tone selectors render together. If we're
-            # at column 0 with no previous cell, drop it.
-            if self.cursor_col > 0:
-                prev_col = self.cursor_col - 1
-                prev_ch, prev_sgr = self.grid[self.cursor_row][prev_col]
-                self.grid[self.cursor_row][prev_col] = (prev_ch + ch, prev_sgr)
-            return
-        # Wide chars (CJK, emoji, full-width) need TWO grid cells — one
-        # holding the actual char, the next a zero-width placeholder. If
-        # we didn't reserve that placeholder, the row would emit `cols`
-        # graphical cells but each wide char would take 2 display cells,
-        # making the row > cols wide and forcing the parent terminal to
-        # auto-wrap into the NEXT pane's area.
-        if self.cursor_col >= self.cols:
-            self.cursor_col = 0
-            self._linefeed()
-        if w == 2 and self.cursor_col + 1 >= self.cols:
-            # Wide char would straddle the right edge — wrap first.
-            self.cursor_col = 0
-            self._linefeed()
-        self.grid[self.cursor_row][self.cursor_col] = (ch, self._sgr_cached)
-        self.cursor_col += 1
-        if w == 2:
-            # Empty-string placeholder: emits zero bytes at render time, so
-            # the wide char occupies its rightful 2 display cells without
-            # crowding subsequent cells.
-            if self.cursor_col < self.cols:
-                self.grid[self.cursor_row][self.cursor_col] = (
-                    "",
-                    self._sgr_cached,
-                )
-            self.cursor_col += 1
-
-    def _linefeed(self) -> None:
-        if self.cursor_row >= self.rows - 1:
-            # Scroll up: discard top row, append blank bottom row.
-            self.grid.pop(0)
-            self.grid.append(self._blank_row())
-        else:
-            self.cursor_row += 1
-
-    def _reverse_linefeed(self) -> None:
-        # Reverse index: cursor up, insert a blank row at the TOP if we're
-        # already at the top (and drop the bottom row to keep size). Used
-        # by some pagers and TUIs when scrolling backwards through output.
-        if self.cursor_row <= 0:
-            self.grid.insert(0, self._blank_row())
-            self.grid.pop()
-        else:
-            self.cursor_row -= 1
 
     def _handle_csi(self, params_str: str, final: str) -> None:
         private = params_str.startswith("?")
@@ -785,15 +707,93 @@ class VirtualPane:
             self._sgr_cached = self._sgr.to_sgr()
         # All other finals: silently ignored.
 
+    def _erase_line_to(self, col: int) -> None:
+        row = self.grid[self.cursor_row]
+        for c in range(min(col + 1, self.cols)):
+            row[c] = (" ", "")
+
     def _erase_line_from(self, col: int) -> None:
         row = self.grid[self.cursor_row]
         for c in range(col, self.cols):
             row[c] = (" ", "")
 
-    def _erase_line_to(self, col: int) -> None:
-        row = self.grid[self.cursor_row]
-        for c in range(min(col + 1, self.cols)):
-            row[c] = (" ", "")
+    def _reverse_linefeed(self) -> None:
+        # Reverse index: cursor up, insert a blank row at the TOP if we're
+        # already at the top (and drop the bottom row to keep size). Used
+        # by some pagers and TUIs when scrolling backwards through output.
+        if self.cursor_row <= 0:
+            self.grid.insert(0, self._blank_row())
+            self.grid.pop()
+        else:
+            self.cursor_row -= 1
+
+    def _put_char(self, ch: str) -> None:
+        w = cell_width(ch)
+        if w == 0:
+            # Combining marks / zero-width joiners — attach to the previous
+            # cell so emoji + skin-tone selectors render together. If we're
+            # at column 0 with no previous cell, drop it.
+            if self.cursor_col > 0:
+                prev_col = self.cursor_col - 1
+                prev_ch, prev_sgr = self.grid[self.cursor_row][prev_col]
+                self.grid[self.cursor_row][prev_col] = (prev_ch + ch, prev_sgr)
+            return
+        # Wide chars (CJK, emoji, full-width) need TWO grid cells — one
+        # holding the actual char, the next a zero-width placeholder. If
+        # we didn't reserve that placeholder, the row would emit `cols`
+        # graphical cells but each wide char would take 2 display cells,
+        # making the row > cols wide and forcing the parent terminal to
+        # auto-wrap into the NEXT pane's area.
+        if self.cursor_col >= self.cols:
+            self.cursor_col = 0
+            self._linefeed()
+        if w == 2 and self.cursor_col + 1 >= self.cols:
+            # Wide char would straddle the right edge — wrap first.
+            self.cursor_col = 0
+            self._linefeed()
+        self.grid[self.cursor_row][self.cursor_col] = (ch, self._sgr_cached)
+        self.cursor_col += 1
+        if w == 2:
+            # Empty-string placeholder: emits zero bytes at render time, so
+            # the wide char occupies its rightful 2 display cells without
+            # crowding subsequent cells.
+            if self.cursor_col < self.cols:
+                self.grid[self.cursor_row][self.cursor_col] = (
+                    "",
+                    self._sgr_cached,
+                )
+            self.cursor_col += 1
+
+    def _linefeed(self) -> None:
+        if self.cursor_row >= self.rows - 1:
+            # Scroll up: discard top row, append blank bottom row.
+            self.grid.pop(0)
+            self.grid.append(self._blank_row())
+        else:
+            self.cursor_row += 1
+
+    def _blank_row(self) -> list[tuple[str, str]]:
+        return [(" ", "")] * self.cols
+
+    def resize(self, rows: int, cols: int) -> None:
+        rows = max(1, rows)
+        cols = max(1, cols)
+        # Keep the bottom-right slice (most recent content + leftmost cols).
+        new_grid = [[(" ", "")] * cols for _ in range(rows)]
+        copy_rows = min(rows, self.rows)
+        copy_cols = min(cols, self.cols)
+        for i in range(copy_rows):
+            old_r = self.rows - copy_rows + i
+            new_r = rows - copy_rows + i
+            for c in range(copy_cols):
+                new_grid[new_r][c] = self.grid[old_r][c]
+        self.grid = new_grid
+        self.rows = rows
+        self.cols = cols
+        self.cursor_row = min(self.cursor_row, rows - 1)
+        self.cursor_col = min(self.cursor_col, cols - 1)
+        self.saved_row = min(self.saved_row, rows - 1)
+        self.saved_col = min(self.saved_col, cols - 1)
 
     # ---- rendering ----
 
@@ -1128,19 +1128,12 @@ class Forwarder:
         }
         return self
 
-    def __exit__(self, *_exc) -> None:
-        for s, handler in self._prev.items():
-            signal.signal(s, handler)
-
     def _forward(self, signum, _frame) -> None:
         # No lock: the thread it interrupted might hold it. GIL-atomic sets.
         self._escalated = self.caught is not None
         self.caught = signum
         for proc in list(self._procs):
             signal_to_group(proc, self._signal())
-
-    def _signal(self) -> int:
-        return signal.SIGKILL if self._escalated else self.caught
 
     def popen(self, argv: list[str], **kw) -> subprocess.Popen:
         proc = subprocess.Popen(
@@ -1150,6 +1143,13 @@ class Forwarder:
         if self.caught is not None:
             signal_to_group(proc, self._signal())  # it landed during Popen
         return proc
+
+    def _signal(self) -> int:
+        return signal.SIGKILL if self._escalated else self.caught
+
+    def __exit__(self, *_exc) -> None:
+        for s, handler in self._prev.items():
+            signal.signal(s, handler)
 
     def reap(self, proc: subprocess.Popen) -> int:
         proc.wait()
