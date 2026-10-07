@@ -123,10 +123,11 @@ def main(argv: list[str]) -> int:
     flags = {a for a in argv if a.startswith("--")}
     files = [a for a in argv if not a.startswith("--")]
     if not files or flags - {"--check", "--write"}:
-        print(
-            "usage: reorder-python.py [--check|--write] <file.py> [...]",
-            file=sys.stderr,
-        )
+        with outliving(sys.stderr):
+            print(
+                "usage: reorder-python.py [--check|--write] <file.py> [...]",
+                file=sys.stderr,
+            )
         return 1
     failed = False
     for f in files:
@@ -163,10 +164,42 @@ def main(argv: list[str]) -> int:
 
 
 def say(stream, mark: str, f: str, rest: str) -> None:
-    """One report line, the filename in its own bytes so a tool fed by it
-    (xargs, grep) matches the file whatever the locale; the rest escaped.
-    A stream with no byte layer, or whose encoding isn't ASCII-compatible
-    (UTF-16), gets the line as text."""
+    """One report line. A line to stderr first flushes stdout, so a report
+    captured with 2>&1 reads in order."""
+    if stream is sys.stderr:
+        flush_stdout()
+    with outliving(stream):
+        write_line(stream, mark, f, rest)
+
+
+def flush_stdout() -> None:
+    with outliving(sys.stdout):
+        sys.stdout.flush()
+
+
+@contextlib.contextmanager
+def outliving(stream):
+    """Guards the writes to stream in its body. If stream's reader has quit,
+    its fd is pointed at /dev/null, so later writes and the exit flush
+    succeed and a closed report pipe (| head) never stops the run: --write
+    rewrites, and the exit status judges, every file."""
+    try:
+        yield
+    except BrokenPipeError:
+        null = devnull()
+        os.dup2(null, stream.fileno())
+        os.close(null)
+
+
+def devnull() -> int:
+    return os.open(os.devnull, os.O_WRONLY)
+
+
+def write_line(stream, mark: str, f: str, rest: str) -> None:
+    """The filename in its own bytes so a tool fed by it (xargs, grep)
+    matches the file whatever the locale; the rest escaped. A stream with no
+    byte layer, or whose encoding isn't ASCII-compatible (UTF-16), gets the
+    line as text."""
     buf = getattr(stream, "buffer", None)
     enc = getattr(stream, "encoding", None) or "utf-8"
     if buf is None or "~\n".encode(enc, "replace") != b"~\n":
@@ -641,4 +674,10 @@ def write_atomic(path: str, data: bytes) -> bool:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    # A closed stream is a report nobody reads.
+    sys.stdout = sys.stdout or open(devnull(), "w", closefd=False)
+    sys.stderr = sys.stderr or open(devnull(), "w", closefd=False)
+    try:
+        sys.exit(main(sys.argv[1:]))
+    finally:
+        flush_stdout()

@@ -15,11 +15,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import importlib.machinery
 import importlib.util
 import io
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -654,7 +656,10 @@ def t_symlink():
         with open(real, "w") as f:
             f.write(SWAP_SRC)
         os.symlink("real.py", link)
-        subprocess.run([sys.executable, REORDER, "--write", link], check=True)
+        subprocess.run(
+            [sys.executable, REORDER, "--write", link],
+            check=True, stdout=subprocess.DEVNULL,
+        )
         if not os.path.islink(link):
             raise AssertionError("the symlink was replaced by a file")
         with open(real) as f:
@@ -668,7 +673,8 @@ def t_relative_tests_dir():
         with open(os.path.join(d, "__tests__", "x.py"), "w") as f:
             f.write(SWAP_SRC)
         subprocess.run(
-            [sys.executable, REORDER, "--write", "__tests__/x.py"], cwd=d, check=True
+            [sys.executable, REORDER, "--write", "__tests__/x.py"],
+            cwd=d, check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(d, "__tests__", "x.py")) as f:
             if f.read() != SWAP_SRC:
@@ -733,7 +739,8 @@ def t_symlink_into_tests():
             f.write(SWAP_SRC)
         os.symlink(real, os.path.join(d, "shim.py"))
         subprocess.run(
-            [sys.executable, REORDER, "--write", "shim.py"], cwd=d, check=True
+            [sys.executable, REORDER, "--write", "shim.py"],
+            cwd=d, check=True, stdout=subprocess.DEVNULL,
         )
         with open(real) as f:
             if f.read() != SWAP_SRC:
@@ -748,7 +755,8 @@ def t_checkout_under_tests():
         with open(os.path.join(proj, "x.py"), "w") as f:
             f.write(SWAP_SRC)
         subprocess.run(
-            [sys.executable, REORDER, "--write", "x.py"], cwd=proj, check=True
+            [sys.executable, REORDER, "--write", "x.py"],
+            cwd=proj, check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(proj, "x.py")) as f:
             assert_before(f.read(), "def caller", "def helper")
@@ -766,7 +774,7 @@ def t_absolute_as_given():
             f.write(SWAP_SRC)
         subprocess.run(
             [sys.executable, REORDER, "--write", os.path.join(proj, "x.py")],
-            check=True,
+            check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(proj, "x.py")) as f:
             if f.read() != SWAP_SRC:
@@ -785,7 +793,7 @@ def t_deleted_cwd():
         p = subprocess.Popen(
             ["sh", "-c", 'rmdir "$0" && exec "$@"', gone, sys.executable, REORDER,
              "--write", os.path.join(repo, "x.py")],
-            cwd=gone, stderr=subprocess.PIPE,
+            cwd=gone, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         _, err = p.communicate(timeout=10)
         if p.returncode != 0:
@@ -802,7 +810,7 @@ def t_deleted_cwd_relative():
         p = subprocess.Popen(
             ["sh", "-c", 'rmdir "$0" && exec "$@"', gone, sys.executable, REORDER,
              "--write", "x.py"],
-            cwd=gone, stderr=subprocess.PIPE,
+            cwd=gone, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         _, err = p.communicate(timeout=10)
     if p.returncode != 1 or b"Traceback" in err or b"x.py" not in err:
@@ -817,7 +825,8 @@ def t_symlinked_dir_into_tests():
             f.write(SWAP_SRC)
         os.symlink("tests", os.path.join(d, "t"))
         subprocess.run(
-            [sys.executable, REORDER, "--write", "t/x.py"], cwd=d, check=True
+            [sys.executable, REORDER, "--write", "t/x.py"],
+            cwd=d, check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(d, "tests", "x.py")) as f:
             if f.read() != SWAP_SRC:
@@ -834,7 +843,7 @@ def t_link_above_cwd():
         subprocess.run(
             [sys.executable, REORDER, "--write", "../shim.py"],
             cwd=os.path.join(d, "tests"),
-            check=True,
+            check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(d, "tests", "fake.py")) as f:
             if f.read() != SWAP_SRC:
@@ -850,7 +859,7 @@ def t_absolute_through_dir_link():
         os.symlink("tests", os.path.join(d, "t"))
         subprocess.run(
             [sys.executable, REORDER, "--write", os.path.join(d, "t", "x.py")],
-            check=True,
+            check=True, stdout=subprocess.DEVNULL,
         )
         with open(os.path.join(d, "tests", "x.py")) as f:
             if f.read() != SWAP_SRC:
@@ -914,24 +923,186 @@ def t_say_text_fallback():
         raise AssertionError(repr(raw.getvalue()))
 
 
-@test("an unreadable file's line names it once, as its bytes")
+@test("say() shows each line at once on a line-buffered stream")
+def t_say_line_buffered():
+    rp = load_reorder()
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(
+        io.BufferedWriter(raw), encoding="utf-8", line_buffering=True
+    )
+    rp.say(stream, "~ ", "x.py", "  note")
+    if raw.getvalue() != b"~ x.py  note\n":
+        raise AssertionError(repr(raw.getvalue()))
+
+
+@test("stdout and stderr lines arrive in order under 2>&1")
+def t_report_order():
+    with tempfile.TemporaryDirectory() as d:
+        moved = swapped(os.path.join(d, "moved.py"))
+        broken = os.path.join(d, "broken.py")
+        os.mkdir(broken)
+        p = subprocess.run(
+            [sys.executable, REORDER, "--check", moved, broken],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        )
+    if p.returncode != 1:
+        raise AssertionError(f"exit {p.returncode}: {p.stdout!r}")
+    marks = [line[:1] for line in p.stdout.decode().splitlines()]
+    if marks != ["~", "✗"]:
+        raise AssertionError(repr(p.stdout))
+
+
+def swapped(path: str) -> str:
+    """path, written with SWAP_SRC, which --write reorders."""
+    with open(path, "w") as f:
+        f.write(SWAP_SRC)
+    return path
+
+
+def assert_reordered(path: str) -> None:
+    with open(path) as f:
+        assert_before(f.read(), "def caller", "def helper")
+
+
+@contextlib.contextmanager
+def closed_pipe():
+    """The write end of a pipe whose reader has already quit."""
+    r, w = os.pipe()
+    os.close(r)
+    try:
+        yield w
+    finally:
+        os.close(w)
+
+
+def assert_dir_error(p, name: str) -> None:
+    """p failed on name, a directory, with one line naming it as its bytes."""
+    want = os.fsencode(name) + b": Is a directory\n"
+    if p.returncode != 1 or not p.stderr.endswith(want):
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+
+
+@test("a quit reader never stops --write once stdout's buffer fills")
+def t_closed_pipe_bulk():
+    pad = 240  # every report line is longer than its name's padding
+    with tempfile.TemporaryDirectory() as d, closed_pipe() as w:
+        # stdout's buffer is at most the larger of these
+        size = max(os.fstat(w).st_blksize, io.DEFAULT_BUFFER_SIZE)
+        names = [
+            swapped(os.path.join(d, f"{i:04d}{'x' * pad}.py"))
+            for i in range(2 * size // pad)
+        ]
+        p = subprocess.run(
+            [sys.executable, REORDER, "--write", *names],
+            stdout=w, stderr=subprocess.PIPE,
+        )
+        assert_reordered(names[0])
+        assert_reordered(names[-1])
+    if p.returncode != 0 or p.stderr:
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+
+
+@test("a quit reader leaves a clean run's exit status 0")
+def t_closed_pipe_clean():
+    with tempfile.TemporaryDirectory() as d:
+        name = swapped(os.path.join(d, "a.py"))
+        with closed_pipe() as w:
+            p = subprocess.run(
+                [sys.executable, REORDER, "--write", name],
+                stdout=w, stderr=subprocess.PIPE,
+            )
+    if p.returncode != 0 or p.stderr:
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+
+
+@test("a quit reader leaves a bad command line's exit status 1")
+def t_closed_pipe_usage():
+    with closed_pipe() as w:
+        p = subprocess.run([sys.executable, REORDER], stdout=w, stderr=w)
+    if p.returncode != 1:
+        raise AssertionError(f"exit {p.returncode}")
+
+
+@test("a quit reader leaves an escaping exception its own exit")
+def t_closed_pipe_interrupt():
+    # The second file's encoding probe raises, as a Ctrl-C mid-run would.
+    child = textwrap.dedent("""
+        import runpy, sys, tokenize
+        probe = tokenize.detect_encoding
+        calls = []
+        def interrupt(readline):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return probe(readline)
+        tokenize.detect_encoding = interrupt
+        sys.argv = sys.argv[1:]
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    """)
+    with tempfile.TemporaryDirectory() as d:
+        first = swapped(os.path.join(d, "a.py"))
+        second = swapped(os.path.join(d, "b.py"))
+        with closed_pipe() as w:
+            p = subprocess.run(
+                [sys.executable, "-c", child, REORDER, "--write", first, second],
+                stdout=w, stderr=subprocess.PIPE,
+            )
+    if (
+        p.returncode != -signal.SIGINT
+        or b"KeyboardInterrupt" not in p.stderr
+        or b"Exception ignored" in p.stderr
+    ):
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+
+
+@test("a quit reader under 2>&1 still writes every file past an error")
+def t_closed_pipe():
+    with tempfile.TemporaryDirectory() as d:
+        first = swapped(os.path.join(d, "a.py"))
+        broken = os.path.join(d, "b.py")
+        os.mkdir(broken)
+        last = swapped(os.path.join(d, "c.py"))
+        with closed_pipe() as w:
+            p = subprocess.run(
+                [sys.executable, REORDER, "--write", first, broken, last],
+                stdout=w, stderr=w,
+            )
+        assert_reordered(first)
+        assert_reordered(last)
+    if p.returncode != 1:
+        raise AssertionError(f"exit {p.returncode}")
+
+
+@test("a closed stdout still writes files and reports errors, unwarned")
+def t_closed_stdout():
+    with tempfile.TemporaryDirectory() as d:
+        moved = swapped(os.path.join(d, "a.py"))
+        broken = os.path.join(d, "b.py")
+        os.mkdir(broken)
+        p = subprocess.run(
+            ["sh", "-c", 'exec "$@" 1>&-', "sh",
+             sys.executable, "-X", "dev", REORDER, "--write", moved, broken],
+            stderr=subprocess.PIPE,
+        )
+        assert_reordered(moved)
+    assert_dir_error(p, broken)
+    if b"Warning" in p.stderr:
+        raise AssertionError(repr(p.stderr))
+
+
+@test("an OSError's line names the path once, as its bytes")
 def t_error_line():
     with tempfile.TemporaryDirectory() as d:
         name = os.path.join(d, "café.py")
-        with open(name, "w") as f:
-            f.write(SWAP_SRC)
-        os.chmod(name, 0)
-        try:
-            p = subprocess.run(
-                [sys.executable, REORDER, name],
-                capture_output=True,
-                env={**os.environ, "PYTHONIOENCODING": "ascii"},
-            )
-        finally:
-            os.chmod(name, 0o644)
-    want = os.fsencode(name) + b": Permission denied\n"
-    if p.returncode != 1 or not p.stderr.endswith(want):
-        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+        os.mkdir(name)
+        p = subprocess.run(
+            [sys.executable, REORDER, name],
+            capture_output=True,
+            env={**os.environ, "PYTHONIOENCODING": "ascii"},
+        )
+    assert_dir_error(p, name)
 
 
 def main():
