@@ -1291,7 +1291,7 @@ def t_transcript_plain_background():
 @test("a signal reaches a task's group after its leader exits")
 def t_transcript_signal_orphans():
     with transcript_dir() as d:
-        p = _spawn_plain('touch "$TMPDIR/ready-$1"; sleep 28.7 & exit 0')
+        p = _spawn_plain('sleep 28.7 & touch "$TMPDIR/ready-$1"; exit 0')
         wait_for_ready(d, 2)
         os.kill(p.pid, signal.SIGTERM)
         _finish(p)

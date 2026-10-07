@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import codecs
 import concurrent.futures
+import errno
 import fcntl
 import os
 import pty
@@ -884,6 +885,8 @@ def reader(
         if not chunk:
             break
         transcript.write(chunk)
+        if slot.screen is not screen:
+            continue  # the pane has moved on; nobody draws this screen
         text = decoder.decode(chunk)
         if not text:
             continue
@@ -1100,27 +1103,46 @@ def report_failures(results: Results) -> int:
     return aggregate_rc([rc for _, rc, _ in finished])
 
 
+# Per child: True once its exit is seen, or its kqueue while it runs.
+_exits: dict[subprocess.Popen, object] = {}
+
+
 def exited(proc: subprocess.Popen, block: bool = False) -> bool:
     """Whether the child has exited, leaving it unreaped so its pid, and so
     its process group id, can't be reused while `signal_to_group` may aim at
-    it; `block` waits for the exit. macOS's Python before 3.13 has no
-    os.waitid, so kqueue answers there."""
-    if proc.returncode is not None:
+    it; `block` waits for the exit. `Forwarder.reap` forgets the child."""
+    if proc.returncode is not None or _exits.get(proc) is True:
         return True
     if hasattr(os, "waitid"):
         flags = os.WEXITED | os.WNOWAIT | (0 if block else os.WNOHANG)
-        return os.waitid(os.P_PID, proc.pid, flags) is not None
-    kq = select.kqueue()
-    try:
+        done = os.waitid(os.P_PID, proc.pid, flags) is not None
+    else:
+        done = kqueue_exited(proc, block)
+    if done:
+        _exits[proc] = True
+    return done
+
+
+def kqueue_exited(proc: subprocess.Popen, block: bool) -> bool:
+    """`exited` for macOS Pythons before 3.13, which lack os.waitid: one
+    kqueue per child, registered on first ask and closed at its exit."""
+    kq = _exits.get(proc)
+    changes = None
+    if kq is None:
+        kq = _exits[proc] = select.kqueue()
         flags = select.KQ_EV_ADD | select.KQ_EV_ONESHOT
-        event = select.kevent(
-            proc.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT
-        )
-        return bool(kq.control([event], 1, None if block else 0))
-    except ProcessLookupError:
-        return True  # registering on a zombie fails with ESRCH
-    finally:
-        kq.close()
+        changes = [
+            select.kevent(proc.pid, select.KQ_FILTER_PROC, flags, select.KQ_NOTE_EXIT)
+        ]
+    events = kq.control(changes, 1, None if block else 0)
+    if not events:
+        return False
+    kq.close()
+    ev = events[0]
+    # A zombie refuses registration with ESRCH: it has exited.
+    if ev.flags & select.KQ_EV_ERROR and ev.data != errno.ESRCH:
+        raise OSError(ev.data, os.strerror(ev.data))
+    return True
 
 
 def signal_to_group(proc: subprocess.Popen, sig: int) -> None:
@@ -1182,6 +1204,7 @@ class Forwarder:
         exited(proc, block=True)
         self._procs.discard(proc)
         proc.wait()
+        _exits.pop(proc, None)
         return exit_status(proc.returncode)
 
 
