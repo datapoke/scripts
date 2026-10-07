@@ -635,6 +635,65 @@ def t_coding_cookie():
     assert_before(out.decode("latin-1"), "def caller", "def helper")
 
 
+@test("a file with no final newline reorders cleanly")
+def t_no_final_newline():
+    out, rc = run_bytes(SWAP_SRC.rstrip("\n").encode())
+    if rc != 0 or out.endswith(b"\n") or out.count(b"\n") != SWAP_SRC.count("\n") - 1:
+        raise AssertionError(f"exit {rc}: {out!r}")
+    assert_before(out.decode(), "def caller", "def helper")
+
+
+@test("--write through a symlink rewrites its target, keeping the link")
+def t_symlink():
+    with tempfile.TemporaryDirectory() as d:
+        real, link = os.path.join(d, "real.py"), os.path.join(d, "link.py")
+        with open(real, "w") as f:
+            f.write(SWAP_SRC)
+        os.symlink("real.py", link)
+        subprocess.run([sys.executable, REORDER, "--write", link], check=True)
+        if not os.path.islink(link):
+            raise AssertionError("the symlink was replaced by a file")
+        with open(real) as f:
+            assert_before(f.read(), "def caller", "def helper")
+
+
+@test("a relative __tests__/ path is skipped")
+def t_relative_tests_dir():
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "__tests__"))
+        with open(os.path.join(d, "__tests__", "x.py"), "w") as f:
+            f.write(SWAP_SRC)
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "__tests__/x.py"], cwd=d, check=True
+        )
+        with open(os.path.join(d, "__tests__", "x.py")) as f:
+            if f.read() != SWAP_SRC:
+                raise AssertionError("a __tests__/ file was reordered")
+
+
+@test("an unwritable file fails its line and the run goes on")
+def t_unwritable_dir():
+    with tempfile.TemporaryDirectory() as d:
+        locked, open_ = os.path.join(d, "locked"), os.path.join(d, "open")
+        for sub in (locked, open_):
+            os.makedirs(sub)
+            with open(os.path.join(sub, "m.py"), "w") as f:
+                f.write(SWAP_SRC)
+        os.chmod(locked, 0o555)
+        try:
+            p = subprocess.run(
+                [sys.executable, REORDER, "--write",
+                 os.path.join(locked, "m.py"), os.path.join(open_, "m.py")],
+                capture_output=True, text=True,
+            )
+        finally:
+            os.chmod(locked, 0o755)
+        if "Traceback" in p.stderr or "write failed" not in p.stderr or p.returncode != 1:
+            raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
+        with open(os.path.join(open_, "m.py")) as f:
+            assert_before(f.read(), "def caller", "def helper")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Tests for reorder-python.py.")
     ap.add_argument("-k", "--filter", default="")

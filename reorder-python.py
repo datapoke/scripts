@@ -161,12 +161,11 @@ def main(argv: list[str]) -> int:
 def is_test_path(f: str) -> bool:
     """Test code is left alone: its methods form no call graph worth
     ordering, and a double mirrors the order of the class it stands in for."""
-    norm = f.replace("\\", "/")
+    norm = "/" + f.replace("\\", "/")
     base = os.path.basename(norm)
     return (
         "/tests/" in norm
         or "/__tests__/" in norm
-        or norm.startswith("tests/")
         or (base.startswith("test_") and base.endswith(".py"))
         or base.endswith("_test.py")
     )
@@ -180,15 +179,20 @@ def reorder(src: str):
     line numbers of the ones still to come valid. A class already in order,
     or with no run of two methods, is skipped silently.
     """
+    # A last line with no terminator can't move up; lend it one, then take
+    # it back from whatever line ends the file afterwards.
+    lent = "" if not src or src.endswith(("\n", "\r")) else newline_of(src)
+    src += lent
     tree = ast.parse(src)
     lines = split_lines(src)
     deferred = has_future_annotations(tree)
+    headers = header_ends(src)
     notes: list[str] = []
     skipped: list[str] = []
     classes = [s for s in tree.body if isinstance(s, ast.ClassDef)]
     for cls in reversed(classes):
         try:
-            result = reorder_class(cls, lines, src, deferred)
+            result = reorder_class(cls, lines, headers, deferred)
         except LeftAlone as e:
             skipped.append(f"{cls.name}: left alone ({e})")
             continue
@@ -197,7 +201,15 @@ def reorder(src: str):
         start, end, region, note = result
         lines[start : end + 1] = region
         notes.append(f"{cls.name} reordered: {note}")
-    return "".join(lines), list(reversed(notes)), list(reversed(skipped))
+    out = "".join(lines)
+    out = out[: len(out) - len(lent)]
+    return out, list(reversed(notes)), list(reversed(skipped))
+
+
+def newline_of(src: str) -> str:
+    """The file's first line terminator, or \n when it has none."""
+    m = re.search(r"\r\n|\r|\n", src)
+    return m.group() if m else "\n"
 
 
 def split_lines(src: str) -> list[str]:
@@ -205,14 +217,14 @@ def split_lines(src: str) -> list[str]:
     return LINE_RE.findall(src)
 
 
-def reorder_class(cls, lines, src, deferred):
+def reorder_class(cls, lines, headers, deferred):
     """The new lines for one class's member region, or None to leave it."""
     body = list(cls.body)
     if body and is_docstring(body[0]):
         region_start = body[0].end_lineno  # 0-based line after the docstring
         body = body[1:]
     else:
-        region_start = header_end(src, cls) + 1
+        region_start = headers[cls.lineno] + 1
     if len(body) < 2:
         return None
     members = scan_members(body, lines, region_start)
@@ -267,23 +279,24 @@ def is_docstring(stmt: ast.stmt) -> bool:
     )
 
 
-def header_end(src: str, cls: ast.ClassDef) -> int:
-    """0-based line of the `:` that closes the class header."""
+def header_ends(src: str) -> dict[int, int]:
+    """For each `class` keyword's 1-based line, the 0-based line of the `:`
+    that closes its header, from one tokenize pass over the file."""
+    out: dict[int, int] = {}
+    start = None
     depth = 0
-    seen_class = False
     for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-        if tok.start < (cls.lineno, cls.col_offset):
-            continue
-        if tok.type == tokenize.NAME and tok.string == "class":
-            seen_class = True
-        elif seen_class and tok.type == tokenize.OP:
+        if tok.type == tokenize.NAME and tok.string == "class" and start is None:
+            start, depth = tok.start[0], 0
+        elif start is not None and tok.type == tokenize.OP:
             if tok.string in "([{":
                 depth += 1
             elif tok.string in ")]}":
                 depth -= 1
             elif tok.string == ":" and depth == 0:
-                return tok.start[0] - 1
-    raise LeftAlone("no class header")
+                out[start] = tok.start[0] - 1
+                start = None
+    return out
 
 
 def scan_members(body: list[ast.stmt], lines: list[str], region_start: int):
@@ -530,12 +543,14 @@ def invariants_hold(data: bytes, new: bytes, src: str, out: str) -> bool:
 
 
 def fingerprint(src: str) -> list[str]:
-    """Sorted texts of every member of every module-level class."""
+    """Sorted texts of every member of every module-level class, each
+    without its final terminator, which a file's last line may lack."""
     lines = split_lines(src)
     texts = []
     for cls in (s for s in ast.parse(src).body if isinstance(s, ast.ClassDef)):
         for stmt in cls.body:
-            texts.append("".join(lines[first_line(stmt) - 1 : stmt.end_lineno]))
+            text = "".join(lines[first_line(stmt) - 1 : stmt.end_lineno])
+            texts.append(re.sub(r"(?:\r\n|\r|\n)\Z", "", text))
     return sorted(texts)
 
 
@@ -561,15 +576,19 @@ def shape(src: str) -> list:
 
 
 def write_atomic(path: str, data: bytes) -> bool:
-    """Write through a same-directory temp file and rename it into place."""
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".reorder")
+    """Write through a temp file beside the real file, then rename it into
+    place; a symlink keeps pointing at the rewritten target."""
+    path = os.path.realpath(path)
+    tmp = None
     try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".reorder")
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.chmod(tmp, os.stat(path).st_mode & 0o7777)
         os.replace(tmp, path)
     except OSError:
-        os.unlink(tmp)
+        if tmp is not None:
+            os.unlink(tmp)
         return False
     return True
 
