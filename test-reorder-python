@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""
+test-reorder-python — behavioral tests for reorder-python.py.
+
+The PHP twin's `test-reorder-node-methods.sh` holds its orderings; each case
+here ports one of its fixtures to Python, then covers the hazards Python adds:
+a class body executes top to bottom at definition time, so a decorator, a
+default or a class attribute that names another member pins the order.
+
+Usage:
+    test-reorder-python            # run all
+    test-reorder-python -k <pat>   # only tests with <pat> in their name
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REORDER = os.environ.get("REORDER", os.path.join(HERE, "reorder-python.py"))
+
+_tests: list[tuple[str, callable]] = []
+
+
+def test(name: str):
+    def wrap(fn):
+        _tests.append((name, fn))
+        return fn
+
+    return wrap
+
+
+def run(src: str, *flags: str, name: str = "fixture.py", subdir: str = ""):
+    """Write `src` to a temp file, run the reorderer over it with `flags`,
+    and return (file text afterwards, stdout + stderr, exit code)."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, subdir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(textwrap.dedent(src).lstrip("\n"))
+        p = subprocess.run(
+            [sys.executable, REORDER, *flags, path], capture_output=True, text=True
+        )
+        with open(path) as f:
+            return f.read(), p.stdout + p.stderr, p.returncode
+
+
+def written(src: str, *flags: str, **kw) -> str:
+    out, log, rc = run(src, "--write", *flags, **kw)
+    if rc != 0:
+        raise AssertionError(f"exit {rc}: {log}")
+    compile(out, "fixture.py", "exec")
+    return out
+
+
+def assert_before(text: str, first: str, second: str) -> None:
+    a, b = text.find(first), text.find(second)
+    if a < 0 or b < 0:
+        raise AssertionError(f"missing {first!r} or {second!r} in:\n{text}")
+    if a > b:
+        raise AssertionError(f"{second!r} came before {first!r} in:\n{text}")
+
+
+def assert_unchanged(src: str, *flags: str) -> str:
+    out, log, rc = run(src, "--write", *flags)
+    if out != textwrap.dedent(src).lstrip("\n"):
+        raise AssertionError(f"expected no change; got:\n{out}")
+    return log
+
+
+# ----------------------------------------------------------------------
+# (A) Call-graph receiver scoping
+# ----------------------------------------------------------------------
+
+
+@test("every self-dispatch form is an edge")
+def t_self_forms():
+    out = written(
+        """
+        class SelfformsNode(Node):
+            def fill(self, message):
+                self.step()
+
+            def ztail(self):
+                pass
+
+            def step(self):
+                SelfformsNode.deep()
+
+            @classmethod
+            def deep(cls):
+                cls.tip()
+
+            @staticmethod
+            def tip():
+                pass
+        """
+    )
+    assert_before(out, "def step", "def ztail")
+    assert_before(out, "def deep", "def ztail")
+
+
+@test("a call on another object is not an edge")
+def t_foreign_no_cycle():
+    # leaf -> other.root_call() would close a cycle if read as a self-call.
+    out = written(
+        """
+        class ForeignNode(Node):
+            def fill(self, message):
+                self.root_call()
+
+            def leaf(self, other):
+                other.root_call()
+
+            def root_call(self):
+                self.mid()
+
+            def mid(self):
+                self.leaf(None)
+        """
+    )
+    assert_before(out, "def root_call", "def mid")
+    assert_before(out, "def mid", "def leaf")
+
+
+# ----------------------------------------------------------------------
+# (B) NODE policy
+# ----------------------------------------------------------------------
+
+
+@test("node policy: a dual-homed helper sinks below every caller")
+def t_dual_homed_node():
+    out = written(
+        """
+        class DualhomedNode(Node):
+            def fill(self, message):
+                self.materialize()
+
+            def materialize(self):
+                self.apply_mode()
+
+            def mode_a(self):
+                self.set_mode()
+
+            def mode_b(self):
+                self.set_mode()
+
+            def set_mode(self):
+                self.apply_mode()
+
+            def apply_mode(self):
+                pass
+        """
+    )
+    assert_before(out, "def set_mode", "def apply_mode")
+    assert_before(out, "def mode_b", "def apply_mode")
+    assert_before(out, "def mode_b", "def set_mode")
+
+
+@test("node policy: the lifecycle prefix leads, node_schema trails")
+def t_node_prefix():
+    out = written(
+        """
+        class PrefixNode(Node):
+            @classmethod
+            def node_schema(cls):
+                return {}
+
+            def fire(self):
+                pass
+
+            def fill(self, message):
+                pass
+
+            def arguments(self, args):
+                pass
+
+            def __init__(self):
+                pass
+
+            def fire_cb(self):
+                pass
+        """
+    )
+    for a, b in [
+        ("def __init__", "def arguments"),
+        ("def arguments", "def fill"),
+        ("def fill", "def fire_cb"),
+        ("def fire_cb", "def fire("),
+        ("def fire(", "def node_schema"),
+    ]:
+        assert_before(out, a, b)
+
+
+@test("node policy: standalone methods follow the connected block")
+def t_standalone():
+    out = written(
+        """
+        class StandaloneNode(Node):
+            def alpha(self):
+                pass
+
+            def fill(self, message):
+                self.worker()
+
+            def beta(self):
+                pass
+
+            def worker(self):
+                pass
+        """
+    )
+    assert_before(out, "def worker", "def alpha")
+    assert_before(out, "def alpha", "def beta")
+
+
+@test("node policy: the base Node class itself")
+def t_base_node():
+    out = written(
+        """
+        class Node:
+            def helper(self):
+                pass
+
+            def caller_a(self):
+                self.helper()
+
+            def caller_b(self):
+                self.helper()
+        """
+    )
+    assert_before(out, "def caller_a", "def helper")
+    assert_before(out, "def caller_b", "def helper")
+
+
+# ----------------------------------------------------------------------
+# (C) GENERIC policy
+# ----------------------------------------------------------------------
+
+
+@test("generic policy: a shared helper sinks below every caller")
+def t_dual_homed_generic():
+    out = written(
+        """
+        class Plain:
+            def shared(self):
+                pass
+
+            def write_a(self):
+                self.shared()
+
+            def write_b(self):
+                self.shared()
+
+            def __init__(self):
+                pass
+        """
+    )
+    assert_before(out, "def __init__", "def shared")
+    assert_before(out, "def write_a", "def shared")
+    assert_before(out, "def write_b", "def shared")
+
+
+@test("generic policy: an unrelated root doesn't wedge into a chain")
+def t_locality():
+    out = written(
+        """
+        class Locality:
+            def chain_leaf(self):
+                pass
+
+            def chain_top(self):
+                self.chain_mid()
+
+            def loner(self):
+                self.loner_help()
+
+            def chain_mid(self):
+                self.chain_leaf()
+
+            def loner_help(self):
+                pass
+        """
+    )
+    assert_before(out, "def chain_mid", "def loner(")
+
+
+@test("a call inside a lambda or nested def is the method's own edge")
+def t_closure_edges():
+    for body in (
+        "self.deferring(lambda: self.flush())",
+        "def inner():\n                    self.flush()\n\n                self.deferring(inner)",
+        "self.deferring(lambda: self.deferring(lambda: self.flush()))",
+    ):
+        out = written(
+            f"""
+        class ClosureScopeNode(Node):
+            def fill(self, message):
+                self.relay()
+
+            def flush(self):
+                self.sink_it()
+
+            def relay(self):
+                {body}
+
+            def deferring(self, cb):
+                pass
+
+            def sink_it(self):
+                pass
+        """
+        )
+        assert_before(out, "def relay", "def flush")
+
+
+# ----------------------------------------------------------------------
+# (D) Fields
+# ----------------------------------------------------------------------
+
+
+@test("a field stays put; methods reorder only between fields")
+def t_field_barrier():
+    out = written(
+        """
+        class BarrierNode(Node):
+            def helper(self):
+                pass
+
+            def fill(self, message):
+                self.helper()
+
+            MID_CONST = 1
+
+            def tail(self):
+                pass
+
+            def worker(self):
+                self.tail()
+        """
+    )
+    assert_before(out, "def fill", "def helper")
+    assert_before(out, "def helper", "MID_CONST")
+    assert_before(out, "MID_CONST", "def worker")
+    assert_before(out, "def worker", "def tail")
+
+
+@test("a method whose decorator may register it keeps its slot")
+def t_decorator_barrier():
+    out = written(
+        """
+        class Model:
+            def helper(self):
+                pass
+
+            @validator("x")
+            def check_x(cls, v):
+                return v
+
+            def caller(self):
+                self.helper()
+        """
+    )
+    assert_before(out, "def helper", "def check_x")
+    assert_before(out, "def check_x", "def caller")
+
+
+@test("--sort-fields is refused: field order is semantic in Python")
+def t_no_sort_fields():
+    _, log, rc = run(
+        """
+        class C:
+            def go(self):
+                pass
+        """,
+        "--sort-fields",
+    )
+    if rc != 1 or "usage:" not in log:
+        raise AssertionError(f"expected a usage error; got {rc} {log!r}")
+
+
+# ----------------------------------------------------------------------
+# (E) Definition-time order: Python runs a class body top to bottom
+# ----------------------------------------------------------------------
+
+
+@test("a property setter chain leaves its class alone")
+def t_property_chain():
+    log = assert_unchanged(
+        """
+        class Prop:
+            @property
+            def x(self):
+                return self._read()
+
+            @x.setter
+            def x(self, v):
+                pass
+
+            def _read(self):
+                return self.helper()
+
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        """
+    )
+    if "definition-time" not in log:
+        raise AssertionError(f"expected a definition-time note; got {log!r}")
+
+
+@test("a class attribute holding a method stays below it")
+def t_field_holds_method():
+    out = written(
+        """
+        class Table:
+            def _a(self):
+                pass
+
+            def caller(self):
+                self._a()
+
+            HANDLERS = {"a": _a}
+        """
+    )
+    assert_before(out, "def caller", "def _a")
+    assert_before(out, "def _a", "HANDLERS")
+
+
+# ----------------------------------------------------------------------
+# (F) Layout, comments, scope and invariants
+# ----------------------------------------------------------------------
+
+
+@test("the class docstring stays first")
+def t_docstring():
+    out = written(
+        '''
+        class Doc:
+            """Doc string."""
+
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        '''
+    )
+    assert_before(out, '"""Doc string."""', "def caller")
+    assert_before(out, "def caller", "def helper")
+
+
+@test("blank-line spacing stays where it was")
+def t_spacing():
+    out = written(
+        """
+        class Spacing:
+            __slots__ = ("a",)
+
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        """
+    )
+    want = textwrap.dedent(
+        """
+        class Spacing:
+            __slots__ = ("a",)
+
+            def caller(self):
+                self.helper()
+
+            def helper(self):
+                pass
+        """
+    ).lstrip("\n")
+    if out != want:
+        raise AssertionError(f"got:\n{out}")
+
+
+@test("comments travel with their own member")
+def t_comments():
+    out = written(
+        """
+        class Cmt:
+            # helper's lead comment
+            def helper(self):
+                pass
+                # helper's tail comment
+
+            def caller(self):  # caller's same-line comment
+                self.helper()
+        """
+    )
+    assert_before(out, "def caller(self):  # caller's same-line comment", "# helper's lead")
+    assert_before(out, "# helper's lead comment", "def helper")
+    assert_before(out, "def helper", "# helper's tail comment")
+
+
+@test("nested and module-level code is not reordered")
+def t_scope():
+    out = written(
+        """
+        def module_helper():
+            pass
+
+
+        def module_caller():
+            module_helper()
+
+
+        class Outer:
+            def go(self):
+                class Inner:
+                    def b(self):
+                        pass
+
+                    def a(self):
+                        self.b()
+
+                return Inner
+        """
+    )
+    assert_before(out, "def module_helper", "def module_caller")
+    assert_before(out, "def b", "def a")
+
+
+@test("code under tests/ is skipped")
+def t_tests_path():
+    out, _, _ = run(
+        """
+        class Some:
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        """,
+        "--write",
+        subdir="tests",
+    )
+    assert_before(out, "def helper", "def caller")
+
+
+@test("--check reports and exits 1; a clean file exits 0")
+def t_check():
+    src = """
+        class C:
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        """
+    out, log, rc = run(src, "--check")
+    if rc != 1 or "~ " not in log:
+        raise AssertionError(f"expected exit 1 and a report; got {rc} {log!r}")
+    assert_before(out, "def helper", "def caller")
+    _, _, rc = run(written(src), "--check")
+    if rc != 0:
+        raise AssertionError(f"reordered output should pass --check; got {rc}")
+
+
+@test("the default run reports without writing")
+def t_dry_run():
+    out, log, rc = run(
+        """
+        class C:
+            def helper(self):
+                pass
+
+            def caller(self):
+                self.helper()
+        """
+    )
+    if rc != 0 or "reordered: caller, helper" not in log:
+        raise AssertionError(f"got {rc} {log!r}")
+    assert_before(out, "def helper", "def caller")
+
+
+SWAP_SRC = (
+    "class C:\n"
+    "    def helper(self):\n"
+    "        pass\n"
+    "\n"
+    "    def caller(self):\n"
+    "        self.helper()\n"
+)
+
+
+def run_bytes(data: bytes) -> tuple[bytes, int]:
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "fixture.py")
+        with open(path, "wb") as f:
+            f.write(data)
+        p = subprocess.run(
+            [sys.executable, REORDER, "--write", path], capture_output=True
+        )
+        with open(path, "rb") as f:
+            return f.read(), p.returncode
+
+
+@test("CRLF line endings survive byte for byte")
+def t_crlf():
+    out, rc = run_bytes(SWAP_SRC.replace("\n", "\r\n").encode())
+    if rc != 0 or out.count(b"\r\n") != SWAP_SRC.count("\n"):
+        raise AssertionError(f"exit {rc}: {out!r}")
+    assert_before(out.decode(), "def caller", "def helper")
+
+
+@test("a form feed between methods is not a line break")
+def t_form_feed():
+    src = SWAP_SRC.replace("    def caller", "\x0c\n    def caller")
+    out, rc = run_bytes(src.encode())
+    if rc != 0:
+        raise AssertionError(f"exit {rc}: {out!r}")
+    assert_before(out.decode(), "def caller", "def helper")
+
+
+@test("a non-UTF-8 coding cookie is honoured")
+def t_coding_cookie():
+    src = "# -*- coding: latin-1 -*-\n" + SWAP_SRC.replace("pass", "'caf\xe9'")
+    out, rc = run_bytes(src.encode("latin-1"))
+    if rc != 0 or "caf\xe9".encode("latin-1") not in out:
+        raise AssertionError(f"exit {rc}: {out!r}")
+    assert_before(out.decode("latin-1"), "def caller", "def helper")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Tests for reorder-python.py.")
+    ap.add_argument("-k", "--filter", default="")
+    args = ap.parse_args()
+    selected = [(n, fn) for n, fn in _tests if args.filter in n]
+    failed: list[str] = []
+    width = max(len(n) for n, _ in selected)
+    for name, fn in selected:
+        sys.stdout.write(f"  {name:<{width}s} ")
+        try:
+            fn()
+        except AssertionError as e:
+            print(f"\033[1;31mFAIL\033[0m  {e}")
+            failed.append(name)
+        except Exception as e:
+            print(f"\033[1;31mERROR\033[0m {type(e).__name__}: {e}")
+            failed.append(name)
+        else:
+            print("\033[1;32mPASS\033[0m")
+    color = "\033[1;31m" if failed else "\033[1;32m"
+    print(f"\n{color}{len(selected) - len(failed)}/{len(selected)} passed\033[0m")
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()
