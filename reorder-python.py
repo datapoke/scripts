@@ -128,7 +128,7 @@ def main(argv: list[str]) -> int:
         return 1
     failed = False
     for f in files:
-        if is_test_path(f) or is_test_path(os.path.realpath(f)):
+        if is_test_path(f) or is_test_path(os.path.relpath(os.path.realpath(f))):
             continue
         try:
             with open(f, "rb") as fh:
@@ -233,11 +233,11 @@ def reorder_class(cls, lines, headers, deferred):
         k = 0
         while k < len(chunk) and not chunk[k].strip():
             k += 1
-        body = chunk[k:]
-        last = body[-1].rstrip("\r\n")
+        text = chunk[k:]
+        last = text[-1].rstrip("\r\n")
         seps.append(chunk[:k])
-        terms.append(body[-1][len(last) :])
-        contents.append(body[:-1] + [last])
+        terms.append(text[-1][len(last) :])
+        contents.append(text[:-1] + [last])
         prev = m.last
 
     policy = order_methods_node if is_node_class(cls) else order_methods_generic

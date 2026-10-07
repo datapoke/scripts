@@ -705,10 +705,19 @@ def t_mixed_newlines():
         b"    def caller(self):\n"
         b"        return self.helper()"
     )
+    # A member's inner terminators travel with it; its last line's stays put.
+    want = (
+        b"# x\r\n"
+        b"class A:\n"
+        b"    def caller(self):\n"
+        b"        return self.helper()\n"
+        b"\n"
+        b"    def helper(self):\r\n"
+        b"        return 1"
+    )
     out, rc = run_bytes(src)
-    if rc != 0 or sorted(out) != sorted(src) or out.endswith((b"\n", b"\r")):
+    if rc != 0 or out != want:
         raise AssertionError(f"exit {rc}: {out!r}")
-    assert_before(out.decode(), "def caller", "def helper")
 
 
 @test("a symlink into tests/ is skipped like the file it names")
@@ -725,6 +734,20 @@ def t_symlink_into_tests():
         with open(real) as f:
             if f.read() != SWAP_SRC:
                 raise AssertionError("a test file was reordered through a symlink")
+
+
+@test("a checkout under a tests/ directory is still reordered")
+def t_checkout_under_tests():
+    with tempfile.TemporaryDirectory() as d:
+        proj = os.path.join(d, "tests", "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "x.py"), "w") as f:
+            f.write(SWAP_SRC)
+        subprocess.run(
+            [sys.executable, REORDER, "--write", "x.py"], cwd=proj, check=True
+        )
+        with open(os.path.join(proj, "x.py")) as f:
+            assert_before(f.read(), "def caller", "def helper")
 
 
 def main():
