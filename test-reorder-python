@@ -15,6 +15,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib.machinery
+import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -871,6 +875,63 @@ def t_name_bytes():
     if p.returncode != 0 or b"~ " + os.fsencode(name) + b"  " not in p.stdout:
         raise AssertionError(f"exit {p.returncode}: {p.stdout!r} {p.stderr!r}")
     assert_before(rewritten, "def caller", "def helper")
+
+
+@functools.lru_cache(maxsize=None)
+def load_reorder():
+    """reorder-python.py as a registered module, loaded once."""
+    loader = importlib.machinery.SourceFileLoader("reorder_under_test", REORDER)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+@test("say() writes a non-UTF-8 name's own bytes")
+def t_say_surrogates():
+    rp = load_reorder()
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="ascii")
+    rp.say(stream, "~ ", os.fsdecode(b"caf\xe9.py"), "  note")
+    stream.flush()
+    if raw.getvalue() != b"~ caf\xe9.py  note\n":
+        raise AssertionError(repr(raw.getvalue()))
+
+
+@test("say() falls back to text for a stream it can't write bytes to")
+def t_say_text_fallback():
+    rp = load_reorder()
+    text = io.StringIO()
+    rp.say(text, "~ ", "x.py", "  note")
+    raw = io.BytesIO()
+    wide = io.TextIOWrapper(raw, encoding="utf-16")
+    rp.say(wide, "~ ", "café.py", "  note")
+    wide.flush()
+    if text.getvalue() != "~ x.py  note\n":
+        raise AssertionError(repr(text.getvalue()))
+    if raw.getvalue().decode("utf-16") != "~ café.py  note\n":
+        raise AssertionError(repr(raw.getvalue()))
+
+
+@test("an unreadable file's line names it once, as its bytes")
+def t_error_line():
+    with tempfile.TemporaryDirectory() as d:
+        name = os.path.join(d, "café.py")
+        with open(name, "w") as f:
+            f.write(SWAP_SRC)
+        os.chmod(name, 0)
+        try:
+            p = subprocess.run(
+                [sys.executable, REORDER, name],
+                capture_output=True,
+                env={**os.environ, "PYTHONIOENCODING": "ascii"},
+            )
+        finally:
+            os.chmod(name, 0o644)
+    want = os.fsencode(name) + b": Permission denied\n"
+    if p.returncode != 1 or not p.stderr.endswith(want):
+        raise AssertionError(f"exit {p.returncode}: {p.stderr!r}")
 
 
 def main():

@@ -140,7 +140,7 @@ def main(argv: list[str]) -> int:
             src = data.decode(encoding)
             out, notes, skipped = reorder(src)
         except (OSError, SyntaxError, UnicodeDecodeError, tokenize.TokenError) as e:
-            say(sys.stderr, "✗ ", f, f": {e}")
+            say(sys.stderr, "✗ ", f, f": {getattr(e, 'strerror', None) or e}")
             failed = True
             continue
         for note in skipped:
@@ -164,20 +164,22 @@ def main(argv: list[str]) -> int:
 
 def say(stream, mark: str, f: str, rest: str) -> None:
     """One report line, the filename in its own bytes so a tool fed by it
-    (xargs, grep) matches the file whatever the locale; the rest escaped."""
+    (xargs, grep) matches the file whatever the locale; the rest escaped.
+    A stream with no byte layer, or whose encoding isn't ASCII-compatible
+    (UTF-16), gets the line as text."""
     buf = getattr(stream, "buffer", None)
-    if buf is None:  # a text-only stream, such as a StringIO redirect
+    enc = getattr(stream, "encoding", None) or "utf-8"
+    if buf is None or "~\n".encode(enc, "replace") != b"~\n":
         stream.write(f"{mark}{f}{rest}\n")
         return
-    enc = stream.encoding or "utf-8"
-    stream.flush()
     buf.write(
         mark.encode(enc, "backslashreplace")
         + os.fsencode(f)
         + rest.encode(enc, "backslashreplace")
         + b"\n"
     )
-    buf.flush()
+    if stream.line_buffering:  # a terminal or stderr: show it now
+        buf.flush()
 
 
 def is_test_code(f: str, real: str) -> bool:
